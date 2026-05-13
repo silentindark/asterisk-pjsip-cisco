@@ -48,7 +48,6 @@
 #define CISCO_CALLINFO_URN "<urn:x-cisco-remotecc:callinfo>"
 #define CISCO_CALLBACK_VAR "CISCO_CALLBACK_NUMBER"
 #define CISCO_HUNTPILOT_VAR "CISCO_HUNTPILOT"
-#define CISCO_CONFERENCE_NAME "Conference"
 #define CISCO_CONFERENCE_DISPLAY_TOKEN "\2004"
 #define CISCO_H264_TIAS 4000000
 #define CISCO_H264_IMAGEATTR "[x=640,y=480,q=0.50]"
@@ -297,13 +296,38 @@ static void remove_headers_by_name(pjsip_tx_data *tdata, const char *name)
 	}
 }
 
-static int connected_line_is_conference(
-	const struct ast_party_connected_line *connected)
+/*!
+ * \brief Decide whether the session's channel has been marked as a
+ *        Conference leg by res_pjsip_cisco_conference.
+ *
+ * We use a channel variable (CISCO_CONFERENCE=1) as the authoritative
+ * signal rather than ast_party_connected_line.source ==
+ * AST_CONNECTED_LINE_UPDATE_SOURCE_CONFERENCE. That enum value is
+ * defined only by the chan_sip cisco-usecallmanager patch we
+ * deliberately do not require — stock Asterisk 20/22/23 doesn't have
+ * it, so referencing it directly broke the CI build against vanilla
+ * trees. The chan_var path is ABI-free.
+ *
+ * The connected-line name is still set to "Conference" by the
+ * conference module (so chan_pjsip's From: display name comes out
+ * right); we don't need to cross-check it here.
+ */
+static int session_channel_is_conference(struct ast_sip_session *session)
 {
-	return connected->source == AST_CONNECTED_LINE_UPDATE_SOURCE_CONFERENCE
-		&& connected->id.name.valid
-		&& !strcmp(S_OR(connected->id.name.str, ""),
-			CISCO_CONFERENCE_NAME);
+	struct ast_channel *channel;
+	const char *flag;
+	int is_conf;
+
+	channel = cisco_session_channel_ref(session);
+	if (!channel) {
+		return 0;
+	}
+	ast_channel_lock(channel);
+	flag = pbx_builtin_getvar_helper(channel, "CISCO_CONFERENCE");
+	is_conf = !ast_strlen_zero(flag) && !strcmp(flag, "1");
+	ast_channel_unlock(channel);
+	ast_channel_unref(channel);
+	return is_conf;
 }
 
 static void append_identity_uri(struct ast_str **identity,
@@ -372,12 +396,8 @@ static void rewrite_conference_identity_headers(struct ast_sip_session *session,
 	char callback[256];
 
 	if (!session->channel || !session->endpoint->id.send_connected_line
+		|| !session_channel_is_conference(session)
 		|| connected_line_copy(session, &connected)) {
-		return;
-	}
-
-	if (!connected_line_is_conference(&connected)) {
-		ast_party_connected_line_free(&connected);
 		return;
 	}
 

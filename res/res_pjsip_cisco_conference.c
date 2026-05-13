@@ -60,6 +60,7 @@
 #include "asterisk/bridge_features.h"
 #include "asterisk/channel.h"
 #include "asterisk/callerid.h"
+#include "asterisk/pbx.h"
 #include "asterisk/strings.h"
 #include "asterisk/utils.h"
 #include "asterisk/taskprocessor.h"
@@ -1095,7 +1096,18 @@ static void mark_channel_as_conference(struct ast_channel *channel,
 		AST_PRES_ALLOWED | AST_PRES_USER_NUMBER_PASSED_SCREEN;
 	connected.id.number.presentation =
 		AST_PRES_ALLOWED | AST_PRES_USER_NUMBER_PASSED_SCREEN;
-	connected.source = AST_CONNECTED_LINE_UPDATE_SOURCE_CONFERENCE;
+	/* Stock Asterisk's enum doesn't include CONFERENCE (it's added only
+	 * by the chan_sip cisco-usecallmanager patch we deliberately avoid
+	 * requiring). UNKNOWN is the inert value — the actual "this is a
+	 * Conference leg" signal we use is the CISCO_CONFERENCE chan_var
+	 * below, which call_extras' rewrite_conference_identity_headers
+	 * reads. */
+	connected.source = AST_CONNECTED_LINE_UPDATE_SOURCE_UNKNOWN;
+
+	/* Plumb the Conference flag via a channel variable too. The
+	 * call_extras hook keys off this rather than the connected-line
+	 * source enum, so we stay ABI-compatible with stock Asterisk. */
+	pbx_builtin_setvar_helper(channel, "CISCO_CONFERENCE", "1");
 
 	ast_channel_update_connected_line(channel, &connected, NULL);
 	ast_log(LOG_NOTICE,

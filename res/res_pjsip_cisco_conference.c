@@ -801,7 +801,17 @@ static int conference_send_task(void *obj)
 			pj_str_t hdr_event_name    = pj_str("Event");
 			pj_str_t hdr_event_val     = pj_str("refer");
 			pj_str_t hdr_substate_name = pj_str("Subscription-State");
-			pj_str_t hdr_substate_val  = pj_str("active;expires=60");
+			/* terminated;reason=noresource: operation finished, no
+			 * more NOTIFYs coming. The sipfrag body below carries the
+			 * "SIP/2.0 200 OK" result. Cisco firmware checked one or
+			 * both of these (the prior "active;expires=60" + no body
+			 * shape was accepted with 200 OK but didn't transition
+			 * the UI), so this is the RFC 3515 §2.4.7-compliant
+			 * minimum that should unambiguously signal success. */
+			pj_str_t hdr_substate_val  = pj_str("terminated;reason=noresource");
+			pj_str_t body_type    = pj_str("message");
+			pj_str_t body_subtype = pj_str("sipfrag");
+			pj_str_t body_text    = pj_str("SIP/2.0 200 OK\r\n");
 
 			pjsip_msg_add_hdr(notify_tdata->msg,
 				(pjsip_hdr *) pjsip_generic_string_hdr_create(
@@ -811,12 +821,16 @@ static int conference_send_task(void *obj)
 				(pjsip_hdr *) pjsip_generic_string_hdr_create(
 					notify_tdata->pool, &hdr_substate_name,
 					&hdr_substate_val));
+			notify_tdata->msg->body = pjsip_msg_body_create(
+				notify_tdata->pool, &body_type, &body_subtype,
+				&body_text);
 
 			if (pjsip_dlg_send_request(data->dlg, notify_tdata,
 					-1, NULL) == PJ_SUCCESS) {
 				ast_log(LOG_NOTICE,
 					"cisco-conference: %s — in-dialog Event:refer "
-					"NOTIFY sent to %s\n",
+					"NOTIFY (sipfrag 200 OK, subscription terminated) "
+					"sent to %s\n",
 					endpoint_id, data->contact->uri);
 			} else {
 				ast_log(LOG_WARNING,

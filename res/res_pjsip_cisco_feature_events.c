@@ -1000,13 +1000,40 @@ static struct ast_sip_endpoint_identifier cisco_mac_identifier = {
  * Writing DND/HuntGroup: any ast_true/ast_false value.
  * Writing CallForward: empty / ast_false value clears the key; any
  *   other value is stored verbatim as the forward target.
+ *
+ * Every entry point goes through cisco_func_validate() which rejects
+ * an empty argument and any endpoint id that has no [name] type=cisco
+ * section. Without the type=cisco check, a dialplan typo (or a
+ * non-Cisco endpoint id) would silently create astdb entries under
+ * DND/<typo> / HuntGroup/<typo> / CF/<typo> and, for DND, publish a
+ * PJSIP:<typo> presence event that would survive in the stasis cache.
+ * The DOCUMENTATION block above promises the type=cisco contract;
+ * this is where it gets enforced.
  * ---------------------------------------------------------------------- */
+
+static int cisco_func_validate(const char *cmd, const char *data)
+{
+	struct cisco_endpoint *cisco;
+
+	if (ast_strlen_zero(data)) {
+		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+		return -1;
+	}
+	cisco = cisco_endpoint_get(data);
+	if (!cisco) {
+		ast_log(LOG_WARNING,
+			"%s: endpoint '%s' has no [name] type=cisco section "
+			"in pjsip.conf — refusing to mutate astdb\n", cmd, data);
+		return -1;
+	}
+	ao2_cleanup(cisco);
+	return 0;
+}
 
 static int cisco_dnd_func_read(struct ast_channel *chan, const char *cmd,
 	char *data, char *buf, size_t buflen)
 {
-	if (ast_strlen_zero(data)) {
-		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+	if (cisco_func_validate(cmd, data)) {
 		return -1;
 	}
 	ast_copy_string(buf, cisco_dnd_is_enabled(data) ? "YES" : "", buflen);
@@ -1016,8 +1043,7 @@ static int cisco_dnd_func_read(struct ast_channel *chan, const char *cmd,
 static int cisco_dnd_func_write(struct ast_channel *chan, const char *cmd,
 	char *data, const char *value)
 {
-	if (ast_strlen_zero(data)) {
-		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+	if (cisco_func_validate(cmd, data)) {
 		return -1;
 	}
 	cisco_dnd_set(data, ast_true(value));
@@ -1033,8 +1059,7 @@ static struct ast_custom_function cisco_dnd_function = {
 static int cisco_huntgroup_func_read(struct ast_channel *chan, const char *cmd,
 	char *data, char *buf, size_t buflen)
 {
-	if (ast_strlen_zero(data)) {
-		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+	if (cisco_func_validate(cmd, data)) {
 		return -1;
 	}
 	ast_copy_string(buf, cisco_huntgroup_is_in(data) ? "YES" : "", buflen);
@@ -1044,8 +1069,7 @@ static int cisco_huntgroup_func_read(struct ast_channel *chan, const char *cmd,
 static int cisco_huntgroup_func_write(struct ast_channel *chan, const char *cmd,
 	char *data, const char *value)
 {
-	if (ast_strlen_zero(data)) {
-		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+	if (cisco_func_validate(cmd, data)) {
 		return -1;
 	}
 	cisco_huntgroup_set(data, ast_true(value));
@@ -1061,8 +1085,7 @@ static struct ast_custom_function cisco_huntgroup_function = {
 static int cisco_cfwd_func_read(struct ast_channel *chan, const char *cmd,
 	char *data, char *buf, size_t buflen)
 {
-	if (ast_strlen_zero(data)) {
-		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+	if (cisco_func_validate(cmd, data)) {
 		return -1;
 	}
 	cisco_cfwd_get(data, buf, buflen);
@@ -1072,8 +1095,7 @@ static int cisco_cfwd_func_read(struct ast_channel *chan, const char *cmd,
 static int cisco_cfwd_func_write(struct ast_channel *chan, const char *cmd,
 	char *data, const char *value)
 {
-	if (ast_strlen_zero(data)) {
-		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+	if (cisco_func_validate(cmd, data)) {
 		return -1;
 	}
 	/* Treat empty / false-y values as clear; anything else is the

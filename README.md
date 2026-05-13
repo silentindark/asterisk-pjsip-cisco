@@ -43,7 +43,7 @@ the detailed mapping.
 | `res_pjsip_cisco_register_optionsind` | Attaches the Cisco RemoteCC optionsind body to outgoing REGISTER 200 OK responses for Cisco endpoints. |
 | `res_pjsip_cisco_bulkupdate` | After a Cisco peer REGISTERs, sends an unsolicited REFER carrying multipart bulkupdate body (DND + hunt-group + per-line config). Also hosts the `pjsip cisco {donotdisturb,huntgroup,callforward,bulkupdate} …` CLIs. |
 | `res_pjsip_cisco_unsolicited_blf` | After a Cisco peer REGISTERs, sends an unsolicited Event: presence NOTIFY for each `subscribe=` extension. |
-| `res_pjsip_cisco_service_control` | CLI: `pjsip cisco {check-sync,restart,reset} <endpoint> [contact]` — `[contact]` (a URI substring or `@hash`) targets one phone of a shared line. |
+| `res_pjsip_cisco_service_control` | CLI: `pjsip cisco {check-sync,restart,reset,prt-report} <endpoint> [contact]` — `[contact]` (a URI substring or `@hash`) targets one phone of a shared line. |
 | `res_pjsip_cisco_feature_events` | Handles Cisco DND/CFwdALL softkey state from SUBSCRIBE and PUBLISH (stored in astdb), and resolves the MAC-address From-URI Cisco firmware uses on device-level REFER/PUBLISH by harvesting a MAC→endpoint hint from each authenticated REGISTER. Registers the `CISCO_DND` / `CISCO_HUNTGROUP` / `CISCO_CALLFORWARD` dialplan functions. |
 | `res_pjsip_cisco_call_extras` | Adds Cisco call signaling extras: `Call-Info` RemoteCC metadata, `Supported: X-cisco-sis-10.0.0`, callback number in RPID, and H.264 SDP hints. |
 | `res_pjsip_cisco_remotecc` | Handles Cisco RemoteCC REFERs: token/alarm responses, HLog, MCID, and the **Park / ParkMonitor** softkeys (parks the call into `res_parking` and pushes the slot back to the phone — see [Call parking](#call-parking)). MCID resolves Cisco XML dialog IDs through PJSIP's native dialog lookup. Other softkeys (Confrn, Join, …) are logged and `603`-declined instead of falling through to normal REFER transfer handling. |
@@ -155,7 +155,13 @@ buttons re-render with hook icons.
 asterisk -rx 'pjsip cisco check-sync 1010'   # phone refetches TFTP config
 asterisk -rx 'pjsip cisco restart    1010'   # soft restart
 asterisk -rx 'pjsip cisco reset      1010'   # hard reboot
+asterisk -rx 'pjsip cisco prt-report 1010'   # phone uploads a Problem Report Tool bundle
 ```
+
+`prt-report` tells the phone to run its built-in PRT collector and
+upload the resulting zip to the URL configured in its SEP file
+(`problemReportServerUrl` / `problemReportUploadURL`) — useful for
+capturing firmware logs after a user-reported issue. No reboot.
 
 Each verb takes an optional trailing `[contact]` — a substring matched
 against a registered contact's URI or its `@hash` — so on a shared line

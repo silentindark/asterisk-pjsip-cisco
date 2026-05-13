@@ -18,6 +18,12 @@
  *   pjsip cisco reset <endpoint> [contact]
  *      As restart but body action=reset. Hard reboot.
  *
+ *   pjsip cisco prt-report <endpoint> [contact]
+ *      Same service-control envelope, body action=prt-report (just
+ *      action + RegisterCallId — no version stamps). Tells the phone
+ *      to run its Problem Report Tool and upload the bundle to the
+ *      URL configured in its SEP file. No reboot.
+ *
  * The optional [contact] is a substring matched against each
  * registered contact's URI or its @hash — restarts one phone of a
  * shared line (max_contacts>1). Omitted = every registered contact.
@@ -25,9 +31,10 @@
  * endpoint's contact URIs.
  *
  * These replace chan_sip + cisco-usecallmanager-patch's
- *   sip notify cisco-check-cfg <peer>
- *   sip notify cisco-restart <peer>
- *   sip notify cisco-reset <peer>
+ *   sip notify cisco-check-cfg   <peer>
+ *   sip notify cisco-restart     <peer>
+ *   sip notify cisco-reset       <peer>
+ *   sip notify cisco-prt-report  <peer>
  * which were driven from sip_notify.conf templates.
  *
  * Gating: only operates on endpoints that have a [name] type=cisco
@@ -73,6 +80,7 @@ enum sc_action {
 	SC_CHECK_SYNC,
 	SC_RESTART,
 	SC_RESET,
+	SC_PRT_REPORT,
 };
 
 static int sc_send_notify(struct ast_sip_endpoint *endpoint,
@@ -98,6 +106,15 @@ static int sc_send_notify(struct ast_sip_endpoint *endpoint,
 		event_hdr     = "service-control";
 		sub_state_hdr = "active";
 		action_str    = "reset";
+		break;
+	case SC_PRT_REPORT:
+		/* Same service-control envelope as restart/reset; the phone
+		 * runs its Problem Report Tool and uploads the bundle to the
+		 * URL configured in its SEP file (problemReportServerUrl /
+		 * problemReportUploadURL). No reboot. */
+		event_hdr     = "service-control";
+		sub_state_hdr = "active";
+		action_str    = "prt-report";
 		break;
 	default:
 		return -1;
@@ -173,14 +190,26 @@ static int sc_send_notify(struct ast_sip_endpoint *endpoint,
 		 * cisco-usecallmanager patch's source has a fifth
 		 * FeatureControlVersionStamp line, but adding it makes
 		 * the firmware return 400 Bad Request — sticking to the
-		 * four-stamp shape that's known to work. */
-		ast_str_set(&body_str, 0,
-			"action=%s\r\n"
-			"RegisterCallId={%s}\r\n"
-			"ConfigVersionStamp={00000000-0000-0000-0000-000000000000}\r\n"
-			"DialplanVersionStamp={00000000-0000-0000-0000-000000000000}\r\n"
-			"SoftkeyVersionStamp={00000000-0000-0000-0000-000000000000}\r\n",
-			action_str, register_cid);
+		 * four-stamp shape that's known to work.
+		 *
+		 * prt-report is a two-line variant: the chan_sip patch's
+		 * [cisco-prt-report] template carries only action and
+		 * RegisterCallId (no version stamps), and that's what
+		 * Cisco firmware accepts here. */
+		if (action == SC_PRT_REPORT) {
+			ast_str_set(&body_str, 0,
+				"action=%s\r\n"
+				"RegisterCallId={%s}\r\n",
+				action_str, register_cid);
+		} else {
+			ast_str_set(&body_str, 0,
+				"action=%s\r\n"
+				"RegisterCallId={%s}\r\n"
+				"ConfigVersionStamp={00000000-0000-0000-0000-000000000000}\r\n"
+				"DialplanVersionStamp={00000000-0000-0000-0000-000000000000}\r\n"
+				"SoftkeyVersionStamp={00000000-0000-0000-0000-000000000000}\r\n",
+				action_str, register_cid);
+		}
 
 		pj_strset2(&body_type, "text");
 		pj_strset2(&body_subtype, "plain");
@@ -201,8 +230,7 @@ static int sc_send_notify(struct ast_sip_endpoint *endpoint,
 	}
 
 	ast_log(LOG_NOTICE, "cisco-svc-ctrl: sent %s NOTIFY (Event: %s) to %s\n",
-		action == SC_CHECK_SYNC ? "check-sync" :
-			action == SC_RESTART ? "restart" : "reset",
+		action == SC_CHECK_SYNC ? "check-sync" : action_str,
 		event_hdr, contact->uri);
 	return 0;
 }
@@ -450,10 +478,33 @@ static char *cli_cisco_reset(struct ast_cli_entry *e, int cmd,
 	return cli_cisco_run(a, SC_RESET);
 }
 
+static char *cli_cisco_prt_report(struct ast_cli_entry *e, int cmd,
+	struct ast_cli_args *a)
+{
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjsip cisco prt-report";
+		e->usage =
+			"Usage: pjsip cisco prt-report <endpoint> [contact]\n"
+			"   Send a Cisco service-control prt-report NOTIFY so the\n"
+			"   phone runs its Problem Report Tool and uploads the bundle\n"
+			"   to the URL configured in its SEP file\n"
+			"   (problemReportServerUrl / problemReportUploadURL). No\n"
+			"   reboot. With [contact] (a URI substring or @hash) only\n"
+			"   that phone of a shared line is asked; omit it for every\n"
+			"   registered contact.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return cli_cisco_generate(a);
+	}
+	return cli_cisco_run(a, SC_PRT_REPORT);
+}
+
 static struct ast_cli_entry cli_cisco_cmds[] = {
 	AST_CLI_DEFINE(cli_cisco_check_sync, "Send Cisco check-sync NOTIFY"),
 	AST_CLI_DEFINE(cli_cisco_restart,    "Send Cisco service-control restart NOTIFY"),
 	AST_CLI_DEFINE(cli_cisco_reset,      "Send Cisco service-control reset NOTIFY"),
+	AST_CLI_DEFINE(cli_cisco_prt_report, "Send Cisco service-control prt-report NOTIFY"),
 };
 
 static int load_module(void)

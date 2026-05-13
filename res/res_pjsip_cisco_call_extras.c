@@ -48,6 +48,8 @@
 #define CISCO_CALLINFO_URN "<urn:x-cisco-remotecc:callinfo>"
 #define CISCO_CALLBACK_VAR "CISCO_CALLBACK_NUMBER"
 #define CISCO_HUNTPILOT_VAR "CISCO_HUNTPILOT"
+#define CISCO_CONFERENCE_NAME "Conference"
+#define CISCO_CONFERENCE_DISPLAY_TOKEN "\2004"
 #define CISCO_H264_TIAS 4000000
 #define CISCO_H264_IMAGEATTR "[x=640,y=480,q=0.50]"
 
@@ -110,6 +112,26 @@ static int connected_id_copy(struct ast_sip_session *session,
 	ast_channel_lock(channel);
 	effective_id = ast_channel_connected_effective_id(channel);
 	ast_party_id_copy(connected_id, &effective_id);
+	ast_channel_unlock(channel);
+	ast_channel_unref(channel);
+
+	return 0;
+}
+
+static int connected_line_copy(struct ast_sip_session *session,
+	struct ast_party_connected_line *connected)
+{
+	struct ast_channel *channel;
+
+	ast_party_connected_line_init(connected);
+
+	channel = cisco_session_channel_ref(session);
+	if (!channel) {
+		return -1;
+	}
+
+	ast_channel_lock(channel);
+	ast_party_connected_line_copy(connected, ast_channel_connected(channel));
 	ast_channel_unlock(channel);
 	ast_channel_unref(channel);
 
@@ -262,6 +284,126 @@ static void add_call_info(struct ast_sip_session *session, pjsip_tx_data *tdata)
 	ast_sip_add_header(tdata, "Call-Info", ast_str_buffer(call_info));
 	ast_debug(2, "cisco-call-extras: attached Call-Info '%s'\n",
 		ast_str_buffer(call_info));
+}
+
+static void remove_headers_by_name(pjsip_tx_data *tdata, const char *name)
+{
+	pj_str_t hdr_name;
+	pjsip_hdr *hdr;
+
+	pj_cstr(&hdr_name, name);
+	while ((hdr = pjsip_msg_find_hdr_by_name(tdata->msg, &hdr_name, NULL))) {
+		pj_list_erase(hdr);
+	}
+}
+
+static int connected_line_is_conference(
+	const struct ast_party_connected_line *connected)
+{
+	return connected->source == AST_CONNECTED_LINE_UPDATE_SOURCE_CONFERENCE
+		&& connected->id.name.valid
+		&& !strcmp(S_OR(connected->id.name.str, ""),
+			CISCO_CONFERENCE_NAME);
+}
+
+static void append_identity_uri(struct ast_str **identity,
+	struct ast_sip_session *session, pjsip_tx_data *tdata,
+	const struct ast_party_connected_line *connected,
+	const char *callback)
+{
+	char domain[256];
+	char encoded_user[768];
+	const char *number = connected->id.number.valid
+		? connected->id.number.str : "";
+
+	if (!ast_strlen_zero(number)) {
+		ast_uri_encode(number, encoded_user, sizeof(encoded_user),
+			ast_uri_sip_user);
+	} else {
+		encoded_user[0] = '\0';
+	}
+
+	ast_str_append(identity, 0, "<sip:%s%s%s",
+		encoded_user, !ast_strlen_zero(encoded_user) ? "@" : "",
+		local_domain(session, tdata, domain, sizeof(domain)));
+
+	if (!ast_strlen_zero(callback)) {
+		char encoded_callback[768];
+
+		ast_uri_encode(callback, encoded_callback,
+			sizeof(encoded_callback), ast_uri_sip_user);
+		ast_str_append(identity, 0, ";x-cisco-callback-number=%s",
+			encoded_callback);
+	}
+
+	ast_str_append(identity, 0, ">");
+}
+
+static void add_conference_identity_header(struct ast_sip_session *session,
+	pjsip_tx_data *tdata, const char *name,
+	const struct ast_party_connected_line *connected, int remote_party_id,
+	const char *callback)
+{
+	struct ast_str *identity = ast_str_alloca(512);
+
+	ast_str_set(&identity, 0, "\"%s\" ", CISCO_CONFERENCE_DISPLAY_TOKEN);
+	append_identity_uri(&identity, session, tdata, connected,
+		remote_party_id ? callback : NULL);
+
+	if (remote_party_id) {
+		int presentation = ast_party_id_presentation(&connected->id);
+
+		ast_str_append(&identity, 0, ";party=%s;privacy=%s;screen=%s",
+			session->inv_session && session->inv_session->role == PJSIP_ROLE_UAC
+				? "calling" : "called",
+			(presentation & AST_PRES_RESTRICTION) != AST_PRES_ALLOWED
+				? "full" : "off",
+			(presentation & AST_PRES_NUMBER_TYPE) == AST_PRES_USER_NUMBER_PASSED_SCREEN
+				? "yes" : "no");
+	}
+
+	ast_sip_add_header(tdata, name, ast_str_buffer(identity));
+}
+
+static void rewrite_conference_identity_headers(struct ast_sip_session *session,
+	pjsip_tx_data *tdata)
+{
+	struct ast_party_connected_line connected;
+	char callback[256];
+
+	if (!session->channel || !session->endpoint->id.send_connected_line
+		|| connected_line_copy(session, &connected)) {
+		return;
+	}
+
+	if (!connected_line_is_conference(&connected)) {
+		ast_party_connected_line_free(&connected);
+		return;
+	}
+
+	channel_var_copy(session, CISCO_CALLBACK_VAR, callback, sizeof(callback));
+
+	/* RPID is unconditional here — even with send_rpid=no on the endpoint,
+	 * a Conference-marked leg must carry "\2004" in Remote-Party-ID so the
+	 * phone renders the Conference glyph + localised label. Without this
+	 * the merge still works on the wire (audio is 3-way, no held lines)
+	 * but the line appears as a regular call. PAI stays gated on send_pai
+	 * because Cisco's display logic keys off RPID; PAI presence on a phone
+	 * that isn't configured for it would be surprising. */
+	remove_headers_by_name(tdata, "Remote-Party-ID");
+	add_conference_identity_header(session, tdata,
+		"Remote-Party-ID", &connected, 1, callback);
+
+	if (session->endpoint->id.send_pai) {
+		remove_headers_by_name(tdata, "P-Asserted-Identity");
+		add_conference_identity_header(session, tdata,
+			"P-Asserted-Identity", &connected, 0, NULL);
+	}
+
+	ast_debug(2,
+		"cisco-call-extras: mapped Conference connected-line to "
+		"Cisco display token on identity headers\n");
+	ast_party_connected_line_free(&connected);
 }
 
 static int has_rpid_header(pjsip_tx_data *tdata)
@@ -549,6 +691,7 @@ static void handle_session_outgoing(struct ast_sip_session *session,
 
 	add_supported_x_cisco_sis(tdata);
 	add_rpid_with_callback(session, tdata);
+	rewrite_conference_identity_headers(session, tdata);
 
 	if (method_is(tdata, "INVITE")) {
 		add_call_info(session, tdata);

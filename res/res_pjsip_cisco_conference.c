@@ -24,10 +24,8 @@
  *   - Confrn (3-way conference creation) is implemented as of phase 1b:
  *     parses the inbound REFER's <dialogid> + <consultdialogid>, resolves
  *     both to ast_sip_session, and stitches the two existing 1:1 bridges
- *     into one MULTIMIX bridge via ast_bridge_move. Sends 202 with
- *     Refer-Sub: false (the phone supports norefersub, so no follow-up
- *     NOTIFY is needed). Join (multi-call merge via Select/Unselect) and
- *     RmLastConf are deferred.
+ *     into one MULTIMIX bridge via ast_bridge_move. Join (multi-call
+ *     merge via Select/Unselect) and RmLastConf are deferred.
  *
  * Architecture:
  *   - Registers a pjsip_module at PJSIP_MOD_PRIORITY_APPLICATION - 2,
@@ -58,6 +56,7 @@
 #include "asterisk/module.h"
 #include "asterisk/bridge.h"
 #include "asterisk/channel.h"
+#include "asterisk/callerid.h"
 #include "asterisk/strings.h"
 #include "asterisk/utils.h"
 #include "asterisk/taskprocessor.h"
@@ -574,6 +573,83 @@ static void queue_conflist(struct ast_sip_endpoint *endpoint,
 	}
 }
 
+static void mark_channel_as_conference(struct ast_channel *channel,
+	const char *endpoint_id)
+{
+	struct ast_party_connected_line connected;
+
+	ast_party_connected_line_init(&connected);
+	connected.id.name.str = "Conference";
+	connected.id.name.valid = 1;
+	connected.id.number.str = "";
+	connected.id.number.valid = 1;
+	connected.id.name.presentation =
+		AST_PRES_ALLOWED | AST_PRES_USER_NUMBER_PASSED_SCREEN;
+	connected.id.number.presentation =
+		AST_PRES_ALLOWED | AST_PRES_USER_NUMBER_PASSED_SCREEN;
+	connected.source = AST_CONNECTED_LINE_UPDATE_SOURCE_CONFERENCE;
+
+	ast_channel_update_connected_line(channel, &connected, NULL);
+	ast_log(LOG_NOTICE,
+		"cisco-conference: %s — marked %s connected-line as Conference\n",
+		endpoint_id, ast_channel_name(channel));
+}
+
+static void indicate_remote_unhold(struct ast_channel *channel,
+	const char *endpoint_id, const char *role)
+{
+	if (ast_indicate(channel, AST_CONTROL_UNHOLD)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — failed to indicate UNHOLD on "
+			"%s %s\n", endpoint_id, role, ast_channel_name(channel));
+	} else {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s — indicated UNHOLD on %s %s\n",
+			endpoint_id, role, ast_channel_name(channel));
+	}
+}
+
+static void send_conference_active_notify_locked(pjsip_dialog *dlg,
+	const char *endpoint_id)
+{
+	pjsip_tx_data *notify_tdata = NULL;
+	pj_str_t method_name = pj_str("NOTIFY");
+	pjsip_method method;
+	pj_str_t hdr_event_name    = pj_str("Event");
+	pj_str_t hdr_event_val     = pj_str("refer");
+	pj_str_t hdr_substate_name = pj_str("Subscription-State");
+	pj_str_t hdr_substate_val  = pj_str("active;expires=60");
+
+	pjsip_method_init_np(&method, &method_name);
+	if (pjsip_dlg_create_request(dlg, &method, -1, &notify_tdata)
+			!= PJ_SUCCESS) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — pjsip_dlg_create_request failed "
+			"for active refer NOTIFY\n", endpoint_id);
+		return;
+	}
+
+	pjsip_msg_add_hdr(notify_tdata->msg,
+		(pjsip_hdr *) pjsip_generic_string_hdr_create(
+			notify_tdata->pool, &hdr_event_name, &hdr_event_val));
+	pjsip_msg_add_hdr(notify_tdata->msg,
+		(pjsip_hdr *) pjsip_generic_string_hdr_create(
+			notify_tdata->pool, &hdr_substate_name,
+			&hdr_substate_val));
+
+	if (pjsip_dlg_send_request(dlg, notify_tdata, -1, NULL)
+			!= PJ_SUCCESS) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — pjsip_dlg_send_request failed "
+			"for active refer NOTIFY\n", endpoint_id);
+		return;
+	}
+
+	ast_log(LOG_NOTICE,
+		"cisco-conference: %s — active refer NOTIFY sent\n",
+		endpoint_id);
+}
+
 /*!
  * \brief Create a UAS dialog from the REFER's rdata, send the 202 Accepted
  *        in that dialog, and return the dialog with a held session count.
@@ -641,6 +717,7 @@ static pjsip_dialog *conference_open_uas_dialog_and_202(pjsip_rx_data *rdata,
 		/* Real session ref that survives dec_lock. Matched by
 		 * dec_session in conference_task_data_destroy. */
 		pjsip_dlg_inc_session(dlg, &conference_module);
+		send_conference_active_notify_locked(dlg, endpoint_id);
 	}
 	pjsip_dlg_dec_lock(dlg);
 	return kept ? dlg : NULL;
@@ -664,20 +741,17 @@ static pjsip_dialog *conference_open_uas_dialog_and_202(pjsip_rx_data *rdata,
  *   3. Move chan_remote_A from bridge_A — bridge_A is now empty and
  *      dissolves (DISSOLVE_EMPTY).
  *   4. Move chan_remote_B from bridge_B into the conference.
- *      bridge_B still has chan_phone_B sitting in it alone; the phone
- *      observes the audio merge and BYEs that leg on its own, after
- *      which bridge_B dissolves too.
+ *      chan_phone_B is explicitly hung up after chan_remote_B moves, so
+ *      bridge_B dissolves too.
  *
  * chan_phone_B is deliberately NOT imparted — the phone only has one
  * physical audio path; chan_phone_A is the anchor. Same pattern the
  * chan_sip cisco-usecallmanager patch's conference_thread uses
  * (see channels/chan_sip.c, handle_remotecc_conference flow).
  *
- * No Event:refer NOTIFY is sent — cisco_send_refer_response already put
- * `Refer-Sub: false` on our 202, so no implicit subscription exists for
- * the phone to wait on. Verified against CP-7975G/9.4.2 on 2026-05-13:
- * the phone's REFER advertises norefersub in its Supported header and
- * accepts the Refer-Sub: false acknowledgement cleanly.
+ * The inbound REFER gets the same implicit-subscription shape as the
+ * chan_sip patch: 202 Accepted, an immediate active Event:refer NOTIFY,
+ * and a terminal Cisco-flavoured completion NOTIFY after bridge cleanup.
  */
 static int conference_send_task(void *obj)
 {
@@ -766,13 +840,25 @@ static int conference_send_task(void *obj)
 	}
 
 	/* Move chan_phone_A first so the user's audio path follows it into
-	 * the conference; then drag remote_A across (bridge_A goes empty,
-	 * dissolves); then remote_B (chan_phone_B stays in bridge_B alone
-	 * until the phone BYEs that leg). attempt_recovery=1: if a move
-	 * fails, put chan back into its source bridge so it isn't orphaned. */
-	if (ast_bridge_move(conf, bridge_a, chan_phone_a, NULL, 1)
-		|| ast_bridge_move(conf, bridge_a, chan_remote_a, NULL, 1)
-		|| ast_bridge_move(conf, bridge_b, chan_remote_b, NULL, 1)) {
+	 * the conference, then mirror chan_sip's channel nudges: UNHOLD the
+	 * two remote bridge peers, move them in, and explicitly hang up the
+	 * consult-side phone anchor after its remote party has joined the
+	 * mix. attempt_recovery=1: if a move fails, put chan back into its
+	 * source bridge so it isn't orphaned.
+	 *
+	 * mark_channel_as_conference and the post-merge REFER/NOTIFY pair
+	 * intentionally run AT THE END (after softhangup), because all three
+	 * trigger outbound SIP transactions and chan_pjsip session refreshes
+	 * that take channel/session locks via bridge-frame relay. With
+	 * chan_phone_b still alive earlier in the sequence, the connected-
+	 * line re-INVITE (carrying Conference RPID = \2004 after the call_
+	 * extras hook unconditionally emits it for Conference-marked legs)
+	 * propagates as a frame through the conf bridge and the residual
+	 * bridge_b, locking peer channel/session state. ast_softhangup on
+	 * chan_phone_b then blocks on that lock and the cisco-conference
+	 * serializer wedges — observed live on 2026-05-14 as four channels
+	 * stuck Up with the taskprocessor at 0 processed / 4 queued. */
+	if (ast_bridge_move(conf, bridge_a, chan_phone_a, NULL, 1)) {
 		ast_log(LOG_WARNING,
 			"cisco-conference: %s — partial bridge move during Confrn; "
 			"some channels may have been left in their original bridges. "
@@ -784,10 +870,38 @@ static int conference_send_task(void *obj)
 		goto cleanup;
 	}
 
+	indicate_remote_unhold(chan_remote_a, endpoint_id, "original remote leg");
+	if (ast_bridge_move(conf, bridge_a, chan_remote_a, NULL, 1)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — failed to move original remote leg "
+			"during Confrn; phone audio path may be in an odd state — "
+			"hang up to recover.\n", endpoint_id);
+		goto cleanup;
+	}
+
+	indicate_remote_unhold(chan_remote_b, endpoint_id, "consult remote leg");
+	if (ast_bridge_move(conf, bridge_b, chan_remote_b, NULL, 1)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — failed to move consult remote leg "
+			"during Confrn; phone audio path may be in an odd state — "
+			"hang up to recover.\n", endpoint_id);
+		goto cleanup;
+	}
+
+	if (ast_softhangup(chan_phone_b, AST_SOFTHANGUP_EXPLICIT)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — failed to hang up consult-side "
+			"anchor %s after Confrn merge\n",
+			endpoint_id, ast_channel_name(chan_phone_b));
+	} else {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s — hung up consult-side anchor %s\n",
+			endpoint_id, ast_channel_name(chan_phone_b));
+	}
+
 	ast_log(LOG_NOTICE,
 		"cisco-conference: %s — built 3-way conference: %s + %s + %s "
-		"(consult-side anchor %s left in residual bridge until phone "
-		"BYEs it)\n",
+		"(consult-side anchor %s hung up)\n",
 		endpoint_id,
 		ast_channel_name(chan_phone_a),
 		ast_channel_name(chan_remote_a),
@@ -812,6 +926,15 @@ static int conference_send_task(void *obj)
 	 * State header, different Content-Type and body. */
 	send_holdretrieve_refer(data);
 	send_conference_completion_notify(data);
+
+	/* Mark the phone leg's connected-line as Conference LAST. chan_pjsip
+	 * turns this into an outbound re-INVITE on the original call's dialog
+	 * carrying the Cisco \2004 display token (added by call_extras' hook),
+	 * which is what flips the phone UI from a regular active call to the
+	 * Conference glyph + localised label. Done last so any locks the
+	 * outbound re-INVITE acquires don't collide with the bridge moves or
+	 * the consult-side softhangup above. */
+	mark_channel_as_conference(chan_phone_a, endpoint_id);
 
 cleanup:
 	ao2_cleanup(conf);

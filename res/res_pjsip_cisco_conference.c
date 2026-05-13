@@ -15,13 +15,19 @@
  * Wire shapes mirror the chan_sip cisco-usecallmanager patch's
  * channels/sip/conference.c:751 sip_conference_participants.
  *
- * Phase 1 is deliberately read-only:
+ * Phase 1 is deliberately limited:
  *   - Mute / Remove / Update softkeys on the menu are NOT yet wired up.
  *     Those arrive as datapassthroughreq REFERs with applicationid=1
  *     (SIP_REMOTECC_CONF_LIST) and a <usercalldata> field; this module
  *     does not yet handle them and they fall through to the regular
  *     RemoteCC handler (which 603 Declines).
- *   - We do not yet build conferences via Confrn — that's Phase 2.
+ *   - Confrn (3-way conference creation) is implemented as of phase 1b:
+ *     parses the inbound REFER's <dialogid> + <consultdialogid>, resolves
+ *     both to ast_sip_session, and stitches the two existing 1:1 bridges
+ *     into one MULTIMIX bridge via ast_bridge_move. Sends 202 with
+ *     Refer-Sub: false (the phone supports norefersub, so no follow-up
+ *     NOTIFY is needed). Join (multi-call merge via Select/Unselect) and
+ *     RmLastConf are deferred.
  *
  * Architecture:
  *   - Registers a pjsip_module at PJSIP_MOD_PRIORITY_APPLICATION - 2,
@@ -548,34 +554,165 @@ static void queue_conflist(struct ast_sip_endpoint *endpoint,
 }
 
 /*!
- * \brief Phase 1a stub: log the inbound Conference REFER, do nothing else.
+ * \brief Build a 3-way multimix bridge from the two existing 1:1 bridges.
  *
- * Resolves the rdata's source contact (so we know which phone of a
- * shared line pressed Confrn) and queues a no-op task that just logs
- * the two dialog IDs. Phase 1b will replace the task body with the
- * actual dialog→channel resolution and multimix bridge plumbing.
+ * The phone has two SIP dialogs at the moment Confrn is pressed:
  *
- * The 202 Accepted is already sent before this is queued — same pattern
- * as ConfList. The Event:refer follow-up NOTIFY is deferred to Phase 1b
- * (sending it now would tell the phone "operation succeeded" while we
- * still haven't actually merged the channels — that'd leave the phone's
- * UI desynced from the audio path).
+ *   active_dialog  — the original call (now held during the consult).
+ *                    chan_phone_A is the phone's leg; chan_remote_A is
+ *                    the other party.
+ *   consult_dialog — the consult call (currently active).
+ *                    chan_phone_B is the phone's leg; chan_remote_B is
+ *                    the other party.
+ *
+ * The merge:
+ *   1. Create a fresh multimix bridge.
+ *   2. Move chan_phone_A from bridge_A into the conference.
+ *   3. Move chan_remote_A from bridge_A — bridge_A is now empty and
+ *      dissolves (DISSOLVE_EMPTY).
+ *   4. Move chan_remote_B from bridge_B into the conference.
+ *      bridge_B still has chan_phone_B sitting in it alone; the phone
+ *      observes the audio merge and BYEs that leg on its own, after
+ *      which bridge_B dissolves too.
+ *
+ * chan_phone_B is deliberately NOT imparted — the phone only has one
+ * physical audio path; chan_phone_A is the anchor. Same pattern the
+ * chan_sip cisco-usecallmanager patch's conference_thread uses
+ * (see channels/chan_sip.c, handle_remotecc_conference flow).
+ *
+ * No Event:refer NOTIFY is sent — cisco_send_refer_response already put
+ * `Refer-Sub: false` on our 202, so no implicit subscription exists for
+ * the phone to wait on. Verified against CP-7975G/9.4.2 on 2026-05-13:
+ * the phone's REFER advertises norefersub in its Supported header and
+ * accepts the Refer-Sub: false acknowledgement cleanly.
  */
 static int conference_send_task(void *obj)
 {
 	struct conference_task_data *data = obj;
 	const char *endpoint_id = ast_sorcery_object_get_id(data->endpoint);
+	struct ast_sip_session *session_a = NULL;
+	struct ast_sip_session *session_b = NULL;
+	struct ast_channel *chan_phone_a = NULL;
+	struct ast_channel *chan_phone_b = NULL;
+	struct ast_channel *chan_remote_a = NULL;
+	struct ast_channel *chan_remote_b = NULL;
+	struct ast_bridge *bridge_a = NULL;
+	struct ast_bridge *bridge_b = NULL;
+	struct ast_bridge *conf = NULL;
+
+	session_a = cisco_dialog_session_lookup(data->active_dialog.call_id,
+		data->active_dialog.local_tag, data->active_dialog.remote_tag);
+	session_b = cisco_dialog_session_lookup(data->consult_dialog.call_id,
+		data->consult_dialog.local_tag, data->consult_dialog.remote_tag);
+	if (!session_a || !session_b) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s pressed Confrn but %s dialog "
+			"doesn't match any live session (active callid=%s, "
+			"consult callid=%s) — aborting\n",
+			endpoint_id,
+			!session_a && !session_b ? "neither"
+				: !session_a ? "active" : "consult",
+			data->active_dialog.call_id, data->consult_dialog.call_id);
+		goto cleanup;
+	}
+
+	chan_phone_a = cisco_session_channel_ref(session_a);
+	chan_phone_b = cisco_session_channel_ref(session_b);
+	if (!chan_phone_a || !chan_phone_b) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s — one or both Confrn legs has no "
+			"live channel (active=%p, consult=%p) — aborting\n",
+			endpoint_id, chan_phone_a, chan_phone_b);
+		goto cleanup;
+	}
+
+	chan_remote_a = ast_channel_bridge_peer(chan_phone_a);
+	chan_remote_b = ast_channel_bridge_peer(chan_phone_b);
+	if (!chan_remote_a || !chan_remote_b) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s — can't conference (%s has no "
+			"bridge peer; happens when a leg is talking to a "
+			"single-channel app like Playback/MoH rather than a "
+			"real call)\n", endpoint_id,
+			!chan_remote_a && !chan_remote_b ? "both legs"
+				: !chan_remote_a ? "active leg" : "consult leg");
+		goto cleanup;
+	}
+
+	ast_channel_lock(chan_phone_a);
+	bridge_a = ast_channel_get_bridge(chan_phone_a);
+	ast_channel_unlock(chan_phone_a);
+	ast_channel_lock(chan_phone_b);
+	bridge_b = ast_channel_get_bridge(chan_phone_b);
+	ast_channel_unlock(chan_phone_b);
+	if (!bridge_a || !bridge_b) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s — one or both legs has no bridge "
+			"object (active=%p, consult=%p) — aborting\n",
+			endpoint_id, bridge_a, bridge_b);
+		goto cleanup;
+	}
+
+	/* MULTIMIX | NATIVE: softmix mixer with native pass-through where
+	 * possible. SMART: let the bridging framework auto-promote tech as
+	 * channel count changes. DISSOLVE_EMPTY: tear down when the last
+	 * channel leaves. No DISSOLVE_HANGUP — we want the mix to keep
+	 * going if the initiator hangs up (cisco_keep_conference=yes
+	 * implicit for Phase 1; configurable later). TRANSFER_BRIDGE_ONLY:
+	 * don't let an attended-transfer-into-conference race the merge. */
+	conf = ast_bridge_base_new(
+		AST_BRIDGE_CAPABILITY_MULTIMIX | AST_BRIDGE_CAPABILITY_NATIVE,
+		AST_BRIDGE_FLAG_DISSOLVE_EMPTY | AST_BRIDGE_FLAG_SMART
+			| AST_BRIDGE_FLAG_TRANSFER_BRIDGE_ONLY,
+		"cisco_conference", NULL, NULL);
+	if (!conf) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — ast_bridge_base_new failed; "
+			"aborting Confrn\n", endpoint_id);
+		goto cleanup;
+	}
+
+	/* Move chan_phone_A first so the user's audio path follows it into
+	 * the conference; then drag remote_A across (bridge_A goes empty,
+	 * dissolves); then remote_B (chan_phone_B stays in bridge_B alone
+	 * until the phone BYEs that leg). attempt_recovery=1: if a move
+	 * fails, put chan back into its source bridge so it isn't orphaned. */
+	if (ast_bridge_move(conf, bridge_a, chan_phone_a, NULL, 1)
+		|| ast_bridge_move(conf, bridge_a, chan_remote_a, NULL, 1)
+		|| ast_bridge_move(conf, bridge_b, chan_remote_b, NULL, 1)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — partial bridge move during Confrn; "
+			"some channels may have been left in their original bridges. "
+			"Phone audio path may be in an odd state — hang up to recover.\n",
+			endpoint_id);
+		/* Leave the (possibly-partial) conf bridge in place; dissolving
+		 * it now could yank channels that did succeed into limbo. The
+		 * DISSOLVE_EMPTY flag will collect it once everyone leaves. */
+		goto cleanup;
+	}
 
 	ast_log(LOG_NOTICE,
-		"cisco-conference: Conference [Phase 1a stub] for %s @ %s\n"
-		"  active  callid=%s localtag=%s remotetag=%s\n"
-		"  consult callid=%s localtag=%s remotetag=%s\n",
-		endpoint_id, data->contact->uri,
-		data->active_dialog.call_id, data->active_dialog.local_tag,
-		data->active_dialog.remote_tag,
-		data->consult_dialog.call_id, data->consult_dialog.local_tag,
-		data->consult_dialog.remote_tag);
+		"cisco-conference: %s — built 3-way conference: %s + %s + %s "
+		"(consult-side anchor %s left in residual bridge until phone "
+		"BYEs it)\n",
+		endpoint_id,
+		ast_channel_name(chan_phone_a),
+		ast_channel_name(chan_remote_a),
+		ast_channel_name(chan_remote_b),
+		ast_channel_name(chan_phone_b));
 
+cleanup:
+	/* Release our +1 ref on the conf bridge — channels imparted into it
+	 * hold their own refs, so it stays alive until DISSOLVE_EMPTY fires. */
+	ao2_cleanup(conf);
+	ao2_cleanup(bridge_a);
+	ao2_cleanup(bridge_b);
+	ast_channel_cleanup(chan_remote_a);
+	ast_channel_cleanup(chan_remote_b);
+	ast_channel_cleanup(chan_phone_a);
+	ast_channel_cleanup(chan_phone_b);
+	ao2_cleanup(session_a);
+	ao2_cleanup(session_b);
 	ao2_cleanup(data);
 	return 0;
 }

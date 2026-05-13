@@ -60,6 +60,17 @@ aliases           =
 ; context — see extensions.conf.cisco-features.sample.
 parkext           = 700
 
+; cisco_keep_conference: Confrn outcome when this phone (the conference
+; initiator) hangs up while ≥2 other parties are still in the mix.
+; no  (default, matches chan_sip cisco-usecallmanager) — dissolve the
+;                                  conference, BYE the remaining legs.
+;                                  Single-button "I left, the call's
+;                                  over" mental model.
+; yes — leave the remaining parties talking. Receptionist-pattern
+;       "drop in, connect them, drop out": you set up a 3-way and step
+;       away; the other two stay connected until they hang up.
+keep_conference   = no
+
 ; ----------------------------------------------------------------
 ; Multi-line example: an 8861 with three lines (1030 primary,
 ; 1031 and 1032 on buttons 2 and 3).

@@ -109,6 +109,15 @@
 					(TRANSFER_CONTEXT chan var, else the endpoint's
 					context).</synopsis>
 				</configOption>
+				<configOption name="keep_conference" default="no">
+					<synopsis>When the Confrn initiator (this phone)
+					hangs up while ≥2 other parties are still mixed
+					in the conference: no (default, matches chan_sip)
+					= tear the conference down, BYE the remaining
+					legs. yes = leave the remaining parties talking
+					(receptionist-style "drop in, connect them, drop
+					out"). Per-endpoint.</synopsis>
+				</configOption>
 			</configObject>
 		</configFile>
 	</configInfo>
@@ -216,6 +225,9 @@ static int load_module(void)
 		OPT_STRINGFIELD_T, 0, STRFLDSET(struct cisco_endpoint, aliases));
 	ast_sorcery_object_field_register(sorcery, "cisco", "parkext", "700",
 		OPT_STRINGFIELD_T, 0, STRFLDSET(struct cisco_endpoint, parkext));
+	ast_sorcery_object_field_register(sorcery, "cisco", "keep_conference",
+		"no", OPT_BOOL_T, 1,
+		FLDSET(struct cisco_endpoint, keep_conference));
 
 	ast_sorcery_load_object(sorcery, "cisco");
 

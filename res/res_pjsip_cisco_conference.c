@@ -55,6 +55,8 @@
 
 #include "asterisk/module.h"
 #include "asterisk/bridge.h"
+#include "asterisk/bridge_channel.h"
+#include "asterisk/bridge_features.h"
 #include "asterisk/channel.h"
 #include "asterisk/callerid.h"
 #include "asterisk/strings.h"
@@ -166,6 +168,10 @@ struct conference_task_data {
 	 * at receipt time — in that case the merge still happens but the
 	 * phone UI won't transition (better than no merge at all). */
 	pjsip_dialog *dlg;
+	/* Snapshot of the cisco sorcery flag at REFER-receipt time. We sample
+	 * here rather than retain the cisco_endpoint ref across the task so
+	 * the task body has one fewer object to manage. */
+	int keep_conference;
 };
 
 static pjsip_module conference_module;       /* forward decl for inc/dec_session */
@@ -609,6 +615,46 @@ static void indicate_remote_unhold(struct ast_channel *channel,
 	}
 }
 
+/*!
+ * \brief Flag chan_phone_A's bridge-channel so the bridge framework
+ *        dissolves the entire conf when this channel hangs up.
+ *
+ * Implements the cisco_keep_conference=no behaviour: when the Confrn
+ * initiator drops, the remaining legs get BYE'd by the bridge dissolve
+ * (the chan_sip patch's default — "the user left, the conference is
+ * over"). With cisco_keep_conference=yes we don't call this and the
+ * bridge sticks around as long as ≥1 channel remains, per the
+ * AST_BRIDGE_FLAG_DISSOLVE_EMPTY on the bridge itself.
+ *
+ * The flag is per-bridge-channel; pjsip session refreshes do not
+ * trigger it, only an actual hangup. Setting it after ast_bridge_move
+ * is safe because the bridge framework consults the flag at hangup
+ * time, not at impart time.
+ */
+static void set_dissolve_on_initiator_hangup(struct ast_channel *channel,
+	const char *endpoint_id)
+{
+	struct ast_bridge_channel *bridge_chan;
+
+	bridge_chan = ast_channel_get_bridge_channel(channel);
+	if (!bridge_chan) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — no bridge_channel for %s; "
+			"cisco_keep_conference=no won't fire on initiator "
+			"hangup\n", endpoint_id, ast_channel_name(channel));
+		return;
+	}
+
+	ast_bridge_features_set_flag(bridge_chan->features,
+		AST_BRIDGE_CHANNEL_FLAG_DISSOLVE_HANGUP);
+	ao2_ref(bridge_chan, -1);
+
+	ast_log(LOG_NOTICE,
+		"cisco-conference: %s — initiator hangup will dissolve the "
+		"conference (%s flagged DISSOLVE_HANGUP)\n",
+		endpoint_id, ast_channel_name(channel));
+}
+
 static void send_conference_active_notify_locked(pjsip_dialog *dlg,
 	const char *endpoint_id)
 {
@@ -870,6 +916,10 @@ static int conference_send_task(void *obj)
 		goto cleanup;
 	}
 
+	if (!data->keep_conference) {
+		set_dissolve_on_initiator_hangup(chan_phone_a, endpoint_id);
+	}
+
 	indicate_remote_unhold(chan_remote_a, endpoint_id, "original remote leg");
 	if (ast_bridge_move(conf, bridge_a, chan_remote_a, NULL, 1)) {
 		ast_log(LOG_WARNING,
@@ -1089,7 +1139,7 @@ static void queue_conference(struct ast_sip_endpoint *endpoint,
 	struct ast_sip_contact *contact,
 	const struct conference_dialog_id *active_dialog,
 	const struct conference_dialog_id *consult_dialog,
-	pjsip_dialog *dlg)
+	pjsip_dialog *dlg, int keep_conference)
 {
 	struct conference_task_data *data;
 
@@ -1105,9 +1155,10 @@ static void queue_conference(struct ast_sip_endpoint *endpoint,
 	data->endpoint = endpoint;
 	ao2_ref(contact, +1);
 	data->contact = contact;
-	data->active_dialog  = *active_dialog;
-	data->consult_dialog = *consult_dialog;
-	data->dlg            = dlg;
+	data->active_dialog   = *active_dialog;
+	data->consult_dialog  = *consult_dialog;
+	data->dlg             = dlg;
+	data->keep_conference = keep_conference;
 
 	if (ast_sip_push_task(conference_serializer, conference_send_task, data)) {
 		ast_log(LOG_WARNING,
@@ -1124,6 +1175,7 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 	pjsip_msg_body *body;
 	struct remotecc_softkey_msg msg;
 	struct ast_sip_contact *contact;
+	int keep_conference = 0;
 
 	if (!rdata || !rdata->msg_info.msg
 		|| rdata->msg_info.msg->type != PJSIP_REQUEST_MSG) {
@@ -1146,6 +1198,7 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 		ao2_cleanup(endpoint);
 		return PJ_FALSE;
 	}
+	keep_conference = cisco->keep_conference;
 	ao2_cleanup(cisco);
 
 	body = cisco_find_remotecc_request_body(rdata);
@@ -1196,7 +1249,7 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 				cisco_send_refer_response(rdata, 202, endpoint);
 			}
 			queue_conference(endpoint, contact, &msg.dialog_id,
-				&msg.consult_dialog_id, dlg);
+				&msg.consult_dialog_id, dlg, keep_conference);
 		}
 		break;
 	default:

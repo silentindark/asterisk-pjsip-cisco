@@ -70,6 +70,15 @@ struct cisco_endpoint {
 	 * This is a static preference; the on/off state itself is read
 	 * at runtime from astdb (key DND/<endpoint-id>). */
 	int dnd_busy;
+	/*! Confrn outcome when the initiator hangs up while ≥2 other parties
+	 * are still in the conference bridge. 0 = match chan_sip's default:
+	 * dissolve the conference, BYE the remaining legs (single-button
+	 * "I left, the call's over" mental model). 1 = persist: the
+	 * remaining legs keep talking, useful for receptionist-pattern
+	 * "drop in, connect them, drop out" flows. Mapped to per-bridge-
+	 * channel DISSOLVE_HANGUP flag on chan_phone_a in conference_send_
+	 * task. */
+	int keep_conference;
 };
 
 /*!

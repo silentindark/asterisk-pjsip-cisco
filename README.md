@@ -62,13 +62,9 @@ the detailed mapping.
 
 You need Asterisk's headers (`asterisk-dev`) plus pjproject's headers.
 **pjproject does not ship as a Debian/Ubuntu system package** — it's
-bundled inside Asterisk's source. Two ways to give the build the
-headers it needs:
-
-**Option A: point at an existing Asterisk source tree (recommended
-for self-builds).** If you have the Asterisk source you already
-build/install from, the bundled pjproject is at
-`<asterisk-src>/third-party/pjproject/source/`. Use:
+bundled inside Asterisk's source — so point the build at the Asterisk
+source tree you build/install from; the bundled pjproject lives at
+`<asterisk-src>/third-party/pjproject/source/`:
 
 ```sh
 git clone https://github.com/s1mm01/asterisk-pjsip-cisco
@@ -84,35 +80,17 @@ When `PJPROJECT_DIR` is set, the Makefile also derives
 locally-built asterisk binary, and any code (ours included) compiled
 against the stale headers crashes at runtime when struct field
 offsets diverge. Building against the source tree's headers keeps
-struct layouts in lockstep with the running binary.
+struct layouts in lockstep with the running binary — and against the
+bundled pjproject keeps the pjproject ABI matched too (version
+mismatches there are real and surface as runtime crashes, not compile
+errors; `<asterisk-src>/third-party/versions.mak` records the
+`PJPROJECT_VERSION` Asterisk bundles).
 
-**Option B: fetch a standalone pjproject release.** If you don't keep
-an Asterisk source tree around, download pjproject yourself:
-
-```sh
-sudo apt install asterisk-dev
-wget https://github.com/pjsip/pjproject/archive/refs/tags/2.16.tar.gz
-tar xzf 2.16.tar.gz && mv pjproject-2.16 pjproject
-: > pjproject/pjlib/include/pj/config_site.h   # empty user-config
-(cd pjproject && ./configure --disable-libwebrtc-aec >/dev/null)
-
-git clone https://github.com/s1mm01/asterisk-pjsip-cisco
-cd asterisk-pjsip-cisco
-make PJPROJECT_INCLUDE="\
-    -DPJ_AUTOCONF=1 \
-    -I$PWD/../pjproject/pjlib/include \
-    -I$PWD/../pjproject/pjlib-util/include \
-    -I$PWD/../pjproject/pjnath/include \
-    -I$PWD/../pjproject/pjmedia/include \
-    -I$PWD/../pjproject/pjsip/include"
-sudo make install
-```
-
-Pin pjproject's version to whatever your installed Asterisk bundles —
-if you have the matching Asterisk source tree, check
-`<asterisk-src>/third-party/versions.mak` for `PJPROJECT_VERSION`.
-ABI mismatches between pjproject versions are real and will surface as
-crashes at runtime, not compile errors.
+(No Asterisk source tree handy? The Makefile also takes
+`PJPROJECT_INCLUDE="-DPJ_AUTOCONF=1 -I.../pjlib/include …"` to point at
+pjproject headers you've unpacked yourself, with Asterisk headers then
+coming from `asterisk-dev` — only safe when `asterisk-dev` is in
+lockstep with the running binary. See the Makefile header comment.)
 
 No `modules.conf` changes required — our PIDF module supplements stock
 `res_pjsip_pidf_body_generator` (additive, both run) and out-races

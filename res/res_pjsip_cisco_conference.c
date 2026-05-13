@@ -138,24 +138,91 @@ static void conflist_task_data_destroy(void *obj)
 	ao2_cleanup(data->endpoint);
 }
 
-/*!
- * \brief Determine whether this REFER carries a ConfList request.
+/* ----------------------------------------------------------------------
+ * Phase 1a: Conference softkey — wire-level scaffolding only.
  *
- * Returns 1 and populates \a dialog_id from the XML body's <dialogid>
- * if so; returns 0 otherwise. ConfList currently arrives only as a
- * softkeyeventmsg with softkeyevent=ConfList — Phase 1 does not yet
- * handle the datapassthroughreq applicationid=1 path used by the
- * Mute / Remove / Update softkeys on the menu we send back.
+ * Parses the inbound Conference REFER's two dialog IDs and logs what we
+ * WOULD do. No bridge manipulation yet. Phase 1b adds dialog→channel
+ * resolution and the actual multimix bridge plumbing.
+ * ---------------------------------------------------------------------- */
+
+struct conference_task_data {
+	struct ast_sip_endpoint *endpoint;
+	struct ast_sip_contact *contact;            /* who pressed Confrn */
+	struct conference_dialog_id active_dialog;  /* <dialogid>: the live call */
+	struct conference_dialog_id consult_dialog; /* <consultdialogid>: the held call */
+};
+
+static void conference_task_data_destroy(void *obj)
+{
+	struct conference_task_data *data = obj;
+	ao2_cleanup(data->contact);
+	ao2_cleanup(data->endpoint);
+}
+
+/*!
+ * \brief Parsed view of an inbound Cisco RemoteCC softkey REFER.
+ *
+ * Populated by detect_remotecc_softkey; consumed by the dispatch in
+ * conference_on_rx_request.
  */
-static int detect_conf_list(pjsip_msg_body *body,
-	struct conference_dialog_id *dialog_id)
+enum remotecc_softkey_kind {
+	REMOTECC_SOFTKEY_NONE = 0,
+	REMOTECC_SOFTKEY_CONFLIST,
+	REMOTECC_SOFTKEY_CONFERENCE,
+};
+
+struct remotecc_softkey_msg {
+	enum remotecc_softkey_kind kind;
+	struct conference_dialog_id dialog_id;        /* always populated */
+	struct conference_dialog_id consult_dialog_id;/* Conference only */
+};
+
+/*!
+ * \brief Copy the three child fields of <dialogid> / <consultdialogid> /
+ *        <joindialogid> into \a out.
+ *
+ * \retval 1 on a fully-populated dialog ref (callid + both tags non-empty),
+ * \retval 0 otherwise.
+ */
+static int copy_dialog_id(struct ast_xml_node *dialog_node,
+	struct conference_dialog_id *out)
+{
+	if (!dialog_node) {
+		return 0;
+	}
+	memset(out, 0, sizeof(*out));
+	cisco_xml_copy_child_text(dialog_node, "callid", out->call_id,
+		sizeof(out->call_id));
+	cisco_xml_copy_child_text(dialog_node, "localtag", out->local_tag,
+		sizeof(out->local_tag));
+	cisco_xml_copy_child_text(dialog_node, "remotetag", out->remote_tag,
+		sizeof(out->remote_tag));
+	return !ast_strlen_zero(out->call_id)
+		&& !ast_strlen_zero(out->local_tag)
+		&& !ast_strlen_zero(out->remote_tag);
+}
+
+/*!
+ * \brief Parse a Cisco RemoteCC REFER body and classify the softkey.
+ *
+ * Returns 1 + populates \a out for ConfList and Conference (with both
+ * <dialogid> AND, for Conference, <consultdialogid>). Returns 0 for any
+ * other softkey (which leaves the REFER to res_pjsip_cisco_remotecc).
+ *
+ * For Conference: both dialog blocks must be present and complete;
+ * otherwise we 0 it and let the caller pass through.
+ */
+static int detect_remotecc_softkey(pjsip_msg_body *body,
+	struct remotecc_softkey_msg *out)
 {
 	struct ast_xml_doc *doc;
 	struct ast_xml_node *root;
 	struct ast_xml_node *softkey_msg;
-	struct ast_xml_node *dialog_node;
 	char softkey[64];
-	int found = 0;
+	int handled = 0;
+
+	memset(out, 0, sizeof(*out));
 
 	if (!body || body->len > CONFERENCE_MAX_BODY) {
 		return 0;
@@ -179,31 +246,45 @@ static int detect_conf_list(pjsip_msg_body *body,
 	}
 
 	if (!cisco_xml_copy_child_text(softkey_msg, "softkeyevent", softkey,
-			sizeof(softkey)) || strcmp(softkey, "ConfList")) {
+			sizeof(softkey))) {
 		goto done;
 	}
 
-	dialog_node = ast_xml_find_element(ast_xml_node_get_children(softkey_msg),
-		"dialogid", NULL, NULL);
-	if (!dialog_node) {
+	if (!strcmp(softkey, "ConfList")) {
+		out->kind = REMOTECC_SOFTKEY_CONFLIST;
+	} else if (!strcmp(softkey, "Conference")) {
+		out->kind = REMOTECC_SOFTKEY_CONFERENCE;
+	} else {
+		/* Not ours — let remotecc.c handle (HLog/MCID/Park/Join/…). */
 		goto done;
 	}
 
-	memset(dialog_id, 0, sizeof(*dialog_id));
-	cisco_xml_copy_child_text(dialog_node, "callid", dialog_id->call_id,
-		sizeof(dialog_id->call_id));
-	cisco_xml_copy_child_text(dialog_node, "localtag", dialog_id->local_tag,
-		sizeof(dialog_id->local_tag));
-	cisco_xml_copy_child_text(dialog_node, "remotetag", dialog_id->remote_tag,
-		sizeof(dialog_id->remote_tag));
+	if (!copy_dialog_id(ast_xml_find_element(
+			ast_xml_node_get_children(softkey_msg),
+			"dialogid", NULL, NULL),
+			&out->dialog_id)) {
+		out->kind = REMOTECC_SOFTKEY_NONE;
+		goto done;
+	}
 
-	found = !ast_strlen_zero(dialog_id->call_id)
-		&& !ast_strlen_zero(dialog_id->local_tag)
-		&& !ast_strlen_zero(dialog_id->remote_tag);
+	if (out->kind == REMOTECC_SOFTKEY_CONFERENCE) {
+		if (!copy_dialog_id(ast_xml_find_element(
+				ast_xml_node_get_children(softkey_msg),
+				"consultdialogid", NULL, NULL),
+				&out->consult_dialog_id)) {
+			ast_log(LOG_WARNING,
+				"cisco-conference: Conference REFER missing or "
+				"incomplete <consultdialogid> — ignoring\n");
+			out->kind = REMOTECC_SOFTKEY_NONE;
+			goto done;
+		}
+	}
+
+	handled = 1;
 
 done:
 	ast_xml_close(doc);
-	return found;
+	return handled;
 }
 
 static struct ast_channel *bridge_peer_channel_ref(struct ast_channel *self,
@@ -466,13 +547,72 @@ static void queue_conflist(struct ast_sip_endpoint *endpoint,
 	}
 }
 
+/*!
+ * \brief Phase 1a stub: log the inbound Conference REFER, do nothing else.
+ *
+ * Resolves the rdata's source contact (so we know which phone of a
+ * shared line pressed Confrn) and queues a no-op task that just logs
+ * the two dialog IDs. Phase 1b will replace the task body with the
+ * actual dialog→channel resolution and multimix bridge plumbing.
+ *
+ * The 202 Accepted is already sent before this is queued — same pattern
+ * as ConfList. The Event:refer follow-up NOTIFY is deferred to Phase 1b
+ * (sending it now would tell the phone "operation succeeded" while we
+ * still haven't actually merged the channels — that'd leave the phone's
+ * UI desynced from the audio path).
+ */
+static int conference_send_task(void *obj)
+{
+	struct conference_task_data *data = obj;
+	const char *endpoint_id = ast_sorcery_object_get_id(data->endpoint);
+
+	ast_log(LOG_NOTICE,
+		"cisco-conference: Conference [Phase 1a stub] for %s @ %s\n"
+		"  active  callid=%s localtag=%s remotetag=%s\n"
+		"  consult callid=%s localtag=%s remotetag=%s\n",
+		endpoint_id, data->contact->uri,
+		data->active_dialog.call_id, data->active_dialog.local_tag,
+		data->active_dialog.remote_tag,
+		data->consult_dialog.call_id, data->consult_dialog.local_tag,
+		data->consult_dialog.remote_tag);
+
+	ao2_cleanup(data);
+	return 0;
+}
+
+static void queue_conference(struct ast_sip_endpoint *endpoint,
+	struct ast_sip_contact *contact,
+	const struct conference_dialog_id *active_dialog,
+	const struct conference_dialog_id *consult_dialog)
+{
+	struct conference_task_data *data;
+
+	data = ao2_alloc(sizeof(*data), conference_task_data_destroy);
+	if (!data) {
+		return;
+	}
+	ao2_ref(endpoint, +1);
+	data->endpoint = endpoint;
+	ao2_ref(contact, +1);
+	data->contact = contact;
+	data->active_dialog  = *active_dialog;
+	data->consult_dialog = *consult_dialog;
+
+	if (ast_sip_push_task(conference_serializer, conference_send_task, data)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: failed to queue Conference task\n");
+		ao2_cleanup(data);
+	}
+}
+
 static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 {
 	struct ast_sip_endpoint *endpoint;
 	struct cisco_endpoint *cisco;
 	const char *endpoint_id;
 	pjsip_msg_body *body;
-	struct conference_dialog_id dialog_id;
+	struct remotecc_softkey_msg msg;
+	struct ast_sip_contact *contact;
 
 	if (!rdata || !rdata->msg_info.msg
 		|| rdata->msg_info.msg->type != PJSIP_REQUEST_MSG) {
@@ -498,40 +638,53 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 	ao2_cleanup(cisco);
 
 	body = cisco_find_remotecc_request_body(rdata);
-	if (!body || !detect_conf_list(body, &dialog_id)) {
+	if (!body || !detect_remotecc_softkey(body, &msg)
+		|| msg.kind == REMOTECC_SOFTKEY_NONE) {
 		ao2_cleanup(endpoint);
 		return PJ_FALSE;
 	}
 
-	/* Capture WHICH contact pressed ConfList. The rdata's source IP:port
-	 * matches the host:port in exactly one of the endpoint's registered
-	 * contacts (the phone that sent the REFER). The follow-up menu REFER
-	 * goes back to that one only — otherwise on a shared line every phone
-	 * shows the same menu and the firmware presents it as confusion. */
-	{
-		struct ast_sip_contact *contact =
-			cisco_endpoint_find_contact_from_rdata(endpoint, rdata);
-
-		if (!contact) {
-			ast_log(LOG_NOTICE,
-				"cisco-conference: %s pressed ConfList but source "
-				"%s:%d doesn't match any registered contact — "
-				"can't target the response\n", endpoint_id,
-				rdata->pkt_info.src_name, rdata->pkt_info.src_port);
-			cisco_send_refer_response(rdata, 202, endpoint);
-			ao2_cleanup(endpoint);
-			return PJ_TRUE;
-		}
-
+	/* Capture WHICH contact pressed the softkey. The rdata's source
+	 * IP:port matches the host:port in exactly one of the endpoint's
+	 * registered contacts (the phone that sent the REFER). The follow-up
+	 * REFER / NOTIFY goes back to that one only — otherwise on a shared
+	 * line every phone receives the response. */
+	contact = cisco_endpoint_find_contact_from_rdata(endpoint, rdata);
+	if (!contact) {
 		ast_log(LOG_NOTICE,
-			"cisco-conference: %s pressed ConfList from %s (callid=%s)\n",
-			endpoint_id, contact->uri, dialog_id.call_id);
-
+			"cisco-conference: %s pressed a softkey but source "
+			"%s:%d doesn't match any registered contact — "
+			"can't target the response\n", endpoint_id,
+			rdata->pkt_info.src_name, rdata->pkt_info.src_port);
 		cisco_send_refer_response(rdata, 202, endpoint);
-		queue_conflist(endpoint, contact, &dialog_id);
-		ao2_cleanup(contact);
+		ao2_cleanup(endpoint);
+		return PJ_TRUE;
 	}
 
+	switch (msg.kind) {
+	case REMOTECC_SOFTKEY_CONFLIST:
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s pressed ConfList from %s (callid=%s)\n",
+			endpoint_id, contact->uri, msg.dialog_id.call_id);
+		cisco_send_refer_response(rdata, 202, endpoint);
+		queue_conflist(endpoint, contact, &msg.dialog_id);
+		break;
+	case REMOTECC_SOFTKEY_CONFERENCE:
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s pressed Confrn from %s "
+			"(active callid=%s, consult callid=%s)\n",
+			endpoint_id, contact->uri,
+			msg.dialog_id.call_id, msg.consult_dialog_id.call_id);
+		cisco_send_refer_response(rdata, 202, endpoint);
+		queue_conference(endpoint, contact, &msg.dialog_id,
+			&msg.consult_dialog_id);
+		break;
+	default:
+		/* Compiler completeness — kind == NONE already returned above. */
+		break;
+	}
+
+	ao2_cleanup(contact);
 	ao2_cleanup(endpoint);
 	return PJ_TRUE;
 }

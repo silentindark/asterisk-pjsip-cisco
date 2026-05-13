@@ -171,6 +171,11 @@ struct conference_task_data {
 
 static pjsip_module conference_module;       /* forward decl for inc/dec_session */
 
+/* Forward decls so conference_send_task can call these — the definitions
+ * live further down the file alongside the bridge-building task body. */
+static void send_holdretrieve_refer(struct conference_task_data *data);
+static void send_conference_completion_notify(struct conference_task_data *data);
+
 static void conference_task_data_destroy(void *obj)
 {
 	struct conference_task_data *data = obj;
@@ -775,81 +780,26 @@ static int conference_send_task(void *obj)
 		ast_channel_name(chan_remote_b),
 		ast_channel_name(chan_phone_b));
 
-	/* Phone UI cue: Cisco firmware (CP-7975G/9.4.2 verified) needs an
-	 * Event:refer NOTIFY to transition the phone's display from
-	 * "active + held" to "Conference" after Confrn succeeds. RFC 4488
-	 * with Refer-Sub: false would say no NOTIFY is needed, but Cisco
-	 * firmware empirically ignores that and still wants the NOTIFY, and
-	 * specifically wants it in-dialog with the REFER (we tested with an
-	 * OOB NOTIFY first — phone display didn't update). The chan_sip
-	 * cisco-usecallmanager patch sends exactly this NOTIFY through the
-	 * dialog the REFER establishes.
+	/* Post-merge wire dance, mirroring the chan_sip patch's
+	 * conference_thread cleanup paths (NON-join case). Without BOTH of
+	 * these the phone's UI stays "active + held" — empirically verified
+	 * across three attempts with progressively closer SIP shapes.
 	 *
-	 * data->dlg was created at REFER receipt via pjsip_dlg_create_uas;
-	 * it holds Call-ID + From/To tags identical to the REFER. Build
-	 * NOTIFY in that dialog and send. Body shape matches chan_sip:
-	 * Event: refer, Subscription-State: active;expires=60, no body. */
-	if (data->dlg) {
-		pjsip_tx_data *notify_tdata = NULL;
-		pj_str_t notify_method_name = pj_str("NOTIFY");
-		pjsip_method notify_method;
-
-		pjsip_method_init_np(&notify_method, &notify_method_name);
-		pjsip_dlg_inc_lock(data->dlg);
-		if (pjsip_dlg_create_request(data->dlg, &notify_method, -1,
-				&notify_tdata) == PJ_SUCCESS) {
-			pj_str_t hdr_event_name    = pj_str("Event");
-			pj_str_t hdr_event_val     = pj_str("refer");
-			pj_str_t hdr_substate_name = pj_str("Subscription-State");
-			/* terminated;reason=noresource: operation finished, no
-			 * more NOTIFYs coming. The sipfrag body below carries the
-			 * "SIP/2.0 200 OK" result. Cisco firmware checked one or
-			 * both of these (the prior "active;expires=60" + no body
-			 * shape was accepted with 200 OK but didn't transition
-			 * the UI), so this is the RFC 3515 §2.4.7-compliant
-			 * minimum that should unambiguously signal success. */
-			pj_str_t hdr_substate_val  = pj_str("terminated;reason=noresource");
-			pj_str_t body_type    = pj_str("message");
-			pj_str_t body_subtype = pj_str("sipfrag");
-			pj_str_t body_text    = pj_str("SIP/2.0 200 OK\r\n");
-
-			pjsip_msg_add_hdr(notify_tdata->msg,
-				(pjsip_hdr *) pjsip_generic_string_hdr_create(
-					notify_tdata->pool, &hdr_event_name,
-					&hdr_event_val));
-			pjsip_msg_add_hdr(notify_tdata->msg,
-				(pjsip_hdr *) pjsip_generic_string_hdr_create(
-					notify_tdata->pool, &hdr_substate_name,
-					&hdr_substate_val));
-			notify_tdata->msg->body = pjsip_msg_body_create(
-				notify_tdata->pool, &body_type, &body_subtype,
-				&body_text);
-
-			if (pjsip_dlg_send_request(data->dlg, notify_tdata,
-					-1, NULL) == PJ_SUCCESS) {
-				ast_log(LOG_NOTICE,
-					"cisco-conference: %s — in-dialog Event:refer "
-					"NOTIFY (sipfrag 200 OK, subscription terminated) "
-					"sent to %s\n",
-					endpoint_id, data->contact->uri);
-			} else {
-				ast_log(LOG_WARNING,
-					"cisco-conference: %s — pjsip_dlg_send_request "
-					"failed for the Conference NOTIFY; phone UI "
-					"may not transition\n", endpoint_id);
-			}
-		} else {
-			ast_log(LOG_WARNING,
-				"cisco-conference: %s — pjsip_dlg_create_request "
-				"failed for the Conference NOTIFY; phone UI may "
-				"not transition\n", endpoint_id);
-		}
-		pjsip_dlg_dec_lock(data->dlg);
-	}
+	 * The smoking gun is the FIRST item: until the phone receives a
+	 * "<holdretrievereq>" Cisco-private signal targeting the ORIGINAL
+	 * call, its UI keeps showing that call as held — even though the
+	 * far end is now mixed into the conference. The chan_sip patch's
+	 * inline comment says it best: "We need to signal to the phone to
+	 * take the first call leg off hold, even though the generator on
+	 * that channel has gone due to the masquerade as the phone still
+	 * thinks that it is on hold". The SECOND item (Cisco-flavoured
+	 * NOTIFY) closes the implicit REFER subscription with a Cisco
+	 * status payload rather than RFC 3515 sipfrag — same Subscription-
+	 * State header, different Content-Type and body. */
+	send_holdretrieve_refer(data);
+	send_conference_completion_notify(data);
 
 cleanup:
-	/* Release our +1 ref on the conf bridge — channels imparted into it
-	 * hold their own refs, so it stays alive until DISSOLVE_EMPTY fires. */
 	ao2_cleanup(conf);
 	ao2_cleanup(bridge_a);
 	ao2_cleanup(bridge_b);
@@ -861,6 +811,139 @@ cleanup:
 	ao2_cleanup(session_b);
 	ao2_cleanup(data);
 	return 0;
+}
+
+/*!
+ * \brief OOB REFER to the phone carrying a <holdretrievereq> body for the
+ *        original call's dialog. Cisco-private signal that tells the
+ *        firmware "the leg you have on hold is now in the conference,
+ *        please un-hold it visually".
+ *
+ * Identical wire shape to the chan_sip patch's conference_thread inline
+ * holdretrievereq emission. Uses the same OOB-REFER-with-Content-ID
+ * machinery our ConfList path uses; <dialogid> is filled from the active
+ * (originally held) call. localtag is the phone's side per Cisco
+ * convention.
+ */
+static pjsip_msg_body *holdretrieve_build(pj_pool_t *pool, void *vctx)
+{
+	struct conference_task_data *data = vctx;
+	char xml[1024];
+	pj_str_t type    = pj_str("application");
+	pj_str_t subtype = pj_str("x-cisco-remotecc-request+xml");
+	pj_str_t text;
+
+	snprintf(xml, sizeof(xml),
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+		"<x-cisco-remotecc-request>\n"
+		" <holdretrievereq>\n"
+		"  <dialogid>\n"
+		"   <callid>%s</callid>\n"
+		"   <localtag>%s</localtag>\n"
+		"   <remotetag>%s</remotetag>\n"
+		"  </dialogid>\n"
+		" </holdretrievereq>\n"
+		"</x-cisco-remotecc-request>\n",
+		data->active_dialog.call_id,
+		data->active_dialog.local_tag,
+		data->active_dialog.remote_tag);
+
+	pj_strdup2(pool, &text, xml);
+	return pjsip_msg_body_create(pool, &type, &subtype, &text);
+}
+
+static void send_holdretrieve_refer(struct conference_task_data *data)
+{
+	cisco_endpoint_send_refer_to_contact(data->endpoint, data->contact,
+		"cisco-conference", "cisco-holdretrieve",
+		"holdretrieve REFER",
+		holdretrieve_build, data);
+}
+
+/*!
+ * \brief In-dialog NOTIFY terminating the REFER's implicit subscription,
+ *        carrying the Cisco-flavoured x-cisco-remotecc-response body
+ *        (chan_sip patch's conference_thread cleanup shape).
+ *
+ * Body is a tiny <response><code>200</code></response> wrapped in
+ * <x-cisco-remotecc-response>. This is the Cisco signal that the
+ * conference operation completed (the RFC 3515 message/sipfrag body
+ * we tried first was 200-OK'd by the phone but didn't drive UI
+ * transition — Cisco firmware reads the Content-Type to decide
+ * "this is the conference completion ack").
+ *
+ * NULLs out data->dlg after a successful send so the destructor doesn't
+ * dec_session a second time on top of pjsip's evsub auto-release
+ * (which fires when we send Subscription-State: terminated). pjsip
+ * was logging "Assert failed: dlg->sess_count > 0" without this guard
+ * — non-fatal but a clear sign of double-release.
+ */
+static void send_conference_completion_notify(struct conference_task_data *data)
+{
+	const char *endpoint_id = ast_sorcery_object_get_id(data->endpoint);
+	pjsip_tx_data *notify_tdata = NULL;
+	pj_str_t method_name = pj_str("NOTIFY");
+	pjsip_method method;
+	pj_str_t hdr_event_name    = pj_str("Event");
+	pj_str_t hdr_event_val     = pj_str("refer");
+	pj_str_t hdr_substate_name = pj_str("Subscription-State");
+	pj_str_t hdr_substate_val  = pj_str("terminated;reason=noresource");
+	pj_str_t body_type    = pj_str("application");
+	pj_str_t body_subtype = pj_str("x-cisco-remotecc-response+xml");
+	pj_str_t body_text    = pj_str(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+		"<x-cisco-remotecc-response>\n"
+		" <response>\n"
+		"  <code>200</code>\n"
+		" </response>\n"
+		"</x-cisco-remotecc-response>\n");
+
+	if (!data->dlg) {
+		return;
+	}
+
+	pjsip_method_init_np(&method, &method_name);
+	pjsip_dlg_inc_lock(data->dlg);
+	if (pjsip_dlg_create_request(data->dlg, &method, -1, &notify_tdata)
+			== PJ_SUCCESS) {
+		pjsip_msg_add_hdr(notify_tdata->msg,
+			(pjsip_hdr *) pjsip_generic_string_hdr_create(
+				notify_tdata->pool, &hdr_event_name,
+				&hdr_event_val));
+		pjsip_msg_add_hdr(notify_tdata->msg,
+			(pjsip_hdr *) pjsip_generic_string_hdr_create(
+				notify_tdata->pool, &hdr_substate_name,
+				&hdr_substate_val));
+		notify_tdata->msg->body = pjsip_msg_body_create(
+			notify_tdata->pool, &body_type, &body_subtype,
+			&body_text);
+
+		if (pjsip_dlg_send_request(data->dlg, notify_tdata, -1, NULL)
+				== PJ_SUCCESS) {
+			ast_log(LOG_NOTICE,
+				"cisco-conference: %s — in-dialog completion NOTIFY "
+				"(x-cisco-remotecc-response code=200) sent to %s\n",
+				endpoint_id, data->contact->uri);
+			/* pjsip's evsub layer dec_sessions the dialog when we
+			 * send Subscription-State: terminated; clear our pointer
+			 * so the task destructor doesn't dec_session a 2nd time
+			 * (the "Assert failed: dlg->sess_count > 0" log spam). */
+			data->dlg = NULL;
+		} else {
+			ast_log(LOG_WARNING,
+				"cisco-conference: %s — pjsip_dlg_send_request failed "
+				"for completion NOTIFY; phone UI may not transition\n",
+				endpoint_id);
+		}
+	} else {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — pjsip_dlg_create_request failed "
+			"for completion NOTIFY; phone UI may not transition\n",
+			endpoint_id);
+	}
+	if (data->dlg) {
+		pjsip_dlg_dec_lock(data->dlg);
+	}
 }
 
 static void queue_conference(struct ast_sip_endpoint *endpoint,

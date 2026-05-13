@@ -96,10 +96,14 @@
  *   step if these phones turn out not to re-auth.
  *
  * NOT YET IMPLEMENTED (deferred):
- *   - Server -> phone push when astdb changes via dialplan toggle.
- *     Would require holding the SUBSCRIBE dialog open and pushing a
- *     NOTIFY into it whenever the astdb key changes. The chan_sip
- *     patch's peer->feature_events_dialog branch is the reference.
+ *   - Automatic server -> phone push when astdb changes out of band.
+ *     The CISCO_* dialplan functions and matching `pjsip cisco ...`
+ *     CLI verbs already push a bulkupdate REFER from
+ *     res_pjsip_cisco_bulkupdate; direct DB()/AMI/database writes still
+ *     require an explicit `pjsip cisco bulkupdate` because there is no
+ *     astdb change notification. A feature-events NOTIFY path would
+ *     require holding the SUBSCRIBE dialog open; the chan_sip patch's
+ *     peer->feature_events_dialog branch is the reference.
  *   - PATH B call-forward (the SetForwarding equivalent in PUBLISH).
  *     Cisco firmware appears to use as-feature-event for CFwdALL
  *     even when DND is on PUBLISH, so PATH A handles CF in practice;

@@ -41,10 +41,10 @@ the detailed mapping.
 | `res_pjsip_cisco_endpoint` | Defines the `cisco` sorcery type. Existence of `[name] type=cisco` in `pjsip.conf` is the gating signal for all Cisco-specific behaviour. |
 | `res_pjsip_cisco_pidf_body_generator` | Adds Cisco RPID extensions to PIDF NOTIFY bodies. Coexists with stock `res_pjsip_pidf_body_generator` via the body-supplement API; takes over `cpim-pidf+xml` from stock `res_pjsip_xpidf_body_generator` by load_pri ordering. |
 | `res_pjsip_cisco_register_optionsind` | Attaches the Cisco RemoteCC optionsind body to outgoing REGISTER 200 OK responses for Cisco endpoints. |
-| `res_pjsip_cisco_bulkupdate` | After a Cisco peer REGISTERs, sends an unsolicited REFER carrying multipart bulkupdate body (DND + hunt-group + per-line config). Also hosts the `pjsip cisco {donotdisturb,huntgroup,callforward,bulkupdate} …` CLIs. |
+| `res_pjsip_cisco_bulkupdate` | After a Cisco peer REGISTERs, sends an unsolicited REFER carrying multipart bulkupdate body (DND + hunt-group + per-line config). Also hosts the `pjsip cisco {donotdisturb,huntgroup,callforward,bulkupdate} …` CLIs and the `CISCO_DND` / `CISCO_HUNTGROUP` / `CISCO_CALLFORWARD` dialplan functions. |
 | `res_pjsip_cisco_unsolicited_blf` | After a Cisco peer REGISTERs, sends an unsolicited Event: presence NOTIFY for each `subscribe=` extension. |
 | `res_pjsip_cisco_service_control` | CLI: `pjsip cisco {check-sync,restart,reset,prt-report} <endpoint> [contact]` — `[contact]` (a URI substring or `@hash`) targets one phone of a shared line. |
-| `res_pjsip_cisco_feature_events` | Handles Cisco DND/CFwdALL softkey state from SUBSCRIBE and PUBLISH (stored in astdb), and resolves the MAC-address From-URI Cisco firmware uses on device-level REFER/PUBLISH by harvesting a MAC→endpoint hint from each authenticated REGISTER. Registers the `CISCO_DND` / `CISCO_HUNTGROUP` / `CISCO_CALLFORWARD` dialplan functions. |
+| `res_pjsip_cisco_feature_events` | Handles Cisco DND/CFwdALL softkey state from SUBSCRIBE and PUBLISH (stored in astdb), and resolves the MAC-address From-URI Cisco firmware uses on device-level REFER/PUBLISH by harvesting a MAC→endpoint hint from each authenticated REGISTER. |
 | `res_pjsip_cisco_call_extras` | Adds Cisco call signaling extras: `Call-Info` RemoteCC metadata, `Supported: X-cisco-sis-10.0.0`, callback number in RPID, and H.264 SDP hints. |
 | `res_pjsip_cisco_remotecc` | Handles Cisco RemoteCC REFERs: token/alarm responses, HLog, MCID, and the **Park / ParkMonitor** softkeys (parks the call into `res_parking` and pushes the slot back to the phone — see [Call parking](#call-parking)). MCID resolves Cisco XML dialog IDs through PJSIP's native dialog lookup. Other softkeys (Confrn, Join, …) are logged and `603`-declined instead of falling through to normal REFER transfer handling. |
 | `res_pjsip_cisco_conference` | ConfList softkey: read-only inventory of the bridge participants for the active call leg, surfaced as a Cisco `<CiscoIPPhoneMenu>` on the phone. Phase 1 — Mute/Remove/Update softkey actions and conference building (Confrn / Join) are not yet implemented. |
@@ -295,9 +295,9 @@ shows in-use / ringing fine — it just won't ever show DND.
 
 From dialplan / AMI, toggle feature state through the
 `CISCO_DND`, `CISCO_HUNTGROUP`, and `CISCO_CALLFORWARD` dialplan
-functions (registered by `res_pjsip_cisco_feature_events`) — they
-write the matching astdb key AND, for DND, fire the presence change
-so BLF lamps update:
+functions (registered by `res_pjsip_cisco_bulkupdate`) — they write the
+matching astdb key and push a bulkupdate REFER so the phone UI updates;
+`CISCO_DND` also fires the presence change so BLF lamps update:
 
 ```
 exten => *78,1,Set(CISCO_DND(${CALLERID(num)})=YES)

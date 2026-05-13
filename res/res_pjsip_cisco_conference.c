@@ -586,14 +586,28 @@ static void queue_conflist(struct ast_sip_endpoint *endpoint,
  * adds Refer-Sub: false), we build the dialog ourselves and send the 202
  * inside it, leaving the implicit subscription open for the NOTIFY.
  *
- * pjsip_dlg_create_uas_and_inc_lock returns the dialog already +1
- * session-counted AND locked. We keep that session count past the 202
- * (it's what holds the dialog alive while the task runs) and release the
- * lock unconditionally on the way out. On any failure we explicitly
- * release the session count (back to 0 — dialog will tear down) and
- * return NULL so the caller can fall back to the OOB 202.
+ * Lifecycle bookkeeping is subtle — pjsip's inc_lock and inc_session both
+ * touch sess_count, which makes mismatches silently disastrous:
  *
- * \retval dlg with +1 session count held — caller must dec_session.
+ *   pjsip_dlg_create_uas_and_inc_lock  — creates dlg, takes mutex, AND
+ *     does an inc_lock side effect: sess_count goes 0 → 1.
+ *   pjsip_dlg_dec_lock                  — releases mutex AND drops
+ *     sess_count by 1. If sess_count hits 0 with no pending tsx, the
+ *     dialog is destroyed inside dec_lock.
+ *   pjsip_dlg_inc_session / dec_session — independent of the mutex;
+ *     this is what we want for keeping a dialog alive across function
+ *     returns.
+ *
+ * So on the success path we must add a real session ref before dec_lock,
+ * otherwise sess_count goes 1 → 0 inside dec_lock and the dialog only
+ * survives as long as the inbound REFER's UAS tsx keeps tsx_count > 0
+ * — a race against the conference_send_task serializer.
+ *
+ * On the failure path we don't take that session ref, so dec_lock just
+ * unwinds the inc_lock side effect and the dialog destroys naturally.
+ *
+ * \retval dlg with +1 session count held — caller must dec_session via
+ *         conference_task_data_destroy.
  * \retval NULL on failure (already logged; nothing to release).
  */
 static pjsip_dialog *conference_open_uas_dialog_and_202(pjsip_rx_data *rdata,
@@ -623,10 +637,10 @@ static pjsip_dialog *conference_open_uas_dialog_and_202(pjsip_rx_data *rdata,
 			"phone UI will not transition\n", endpoint_id);
 	}
 
-	if (!kept) {
-		/* Release the +1 from create_uas_and_inc_lock so the dialog
-		 * doesn't leak. */
-		pjsip_dlg_dec_session(dlg, &conference_module);
+	if (kept) {
+		/* Real session ref that survives dec_lock. Matched by
+		 * dec_session in conference_task_data_destroy. */
+		pjsip_dlg_inc_session(dlg, &conference_module);
 	}
 	pjsip_dlg_dec_lock(dlg);
 	return kept ? dlg : NULL;
@@ -897,14 +911,23 @@ static void send_conference_completion_notify(struct conference_task_data *data)
 		"  <code>200</code>\n"
 		" </response>\n"
 		"</x-cisco-remotecc-response>\n");
+	pjsip_dialog *dlg = data->dlg;
 
-	if (!data->dlg) {
+	if (!dlg) {
 		return;
 	}
 
+	/* inc_lock takes the mutex AND increments sess_count by 1; dec_lock
+	 * undoes both. Our caller already added a real session ref via
+	 * pjsip_dlg_inc_session in conference_open_uas_dialog_and_202, so the
+	 * net sess_count delta of inc_lock/dec_lock here is zero — we never
+	 * hit "Assert failed: sess_count > 0" and we never deadlock by
+	 * forgetting to dec_lock. (No need to suppress the destructor's
+	 * dec_session: we're not in the pjsip-simple evsub layer, so nothing
+	 * auto-decrements when we send Subscription-State: terminated.) */
 	pjsip_method_init_np(&method, &method_name);
-	pjsip_dlg_inc_lock(data->dlg);
-	if (pjsip_dlg_create_request(data->dlg, &method, -1, &notify_tdata)
+	pjsip_dlg_inc_lock(dlg);
+	if (pjsip_dlg_create_request(dlg, &method, -1, &notify_tdata)
 			== PJ_SUCCESS) {
 		pjsip_msg_add_hdr(notify_tdata->msg,
 			(pjsip_hdr *) pjsip_generic_string_hdr_create(
@@ -918,17 +941,12 @@ static void send_conference_completion_notify(struct conference_task_data *data)
 			notify_tdata->pool, &body_type, &body_subtype,
 			&body_text);
 
-		if (pjsip_dlg_send_request(data->dlg, notify_tdata, -1, NULL)
+		if (pjsip_dlg_send_request(dlg, notify_tdata, -1, NULL)
 				== PJ_SUCCESS) {
 			ast_log(LOG_NOTICE,
 				"cisco-conference: %s — in-dialog completion NOTIFY "
 				"(x-cisco-remotecc-response code=200) sent to %s\n",
 				endpoint_id, data->contact->uri);
-			/* pjsip's evsub layer dec_sessions the dialog when we
-			 * send Subscription-State: terminated; clear our pointer
-			 * so the task destructor doesn't dec_session a 2nd time
-			 * (the "Assert failed: dlg->sess_count > 0" log spam). */
-			data->dlg = NULL;
 		} else {
 			ast_log(LOG_WARNING,
 				"cisco-conference: %s — pjsip_dlg_send_request failed "
@@ -941,9 +959,7 @@ static void send_conference_completion_notify(struct conference_task_data *data)
 			"for completion NOTIFY; phone UI may not transition\n",
 			endpoint_id);
 	}
-	if (data->dlg) {
-		pjsip_dlg_dec_lock(data->dlg);
-	}
+	pjsip_dlg_dec_lock(dlg);
 }
 
 static void queue_conference(struct ast_sip_endpoint *endpoint,

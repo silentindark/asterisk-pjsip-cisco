@@ -157,11 +157,27 @@ struct conference_task_data {
 	struct ast_sip_contact *contact;            /* who pressed Confrn */
 	struct conference_dialog_id active_dialog;  /* <dialogid>: the live call */
 	struct conference_dialog_id consult_dialog; /* <consultdialogid>: the held call */
+	/* UAS dialog created from the inbound REFER, so we can send the
+	 * follow-up Event:refer NOTIFY in-dialog. Cisco firmware requires
+	 * the NOTIFY to be in-dialog (same Call-ID + From/To tags as the
+	 * REFER) for the phone's UI to transition from "active + held" to
+	 * "Conference"; an OOB NOTIFY is silently ignored. We hold a +1
+	 * session count on the dialog from REFER receipt; the destructor
+	 * below drops it. NULL if pjsip_dlg_create_uas_and_inc_lock failed
+	 * at receipt time — in that case the merge still happens but the
+	 * phone UI won't transition (better than no merge at all). */
+	pjsip_dialog *dlg;
 };
+
+static pjsip_module conference_module;       /* forward decl for inc/dec_session */
 
 static void conference_task_data_destroy(void *obj)
 {
 	struct conference_task_data *data = obj;
+
+	if (data->dlg) {
+		pjsip_dlg_dec_session(data->dlg, &conference_module);
+	}
 	ao2_cleanup(data->contact);
 	ao2_cleanup(data->endpoint);
 }
@@ -554,6 +570,64 @@ static void queue_conflist(struct ast_sip_endpoint *endpoint,
 }
 
 /*!
+ * \brief Create a UAS dialog from the REFER's rdata, send the 202 Accepted
+ *        in that dialog, and return the dialog with a held session count.
+ *
+ * Cisco firmware requires the follow-up Event:refer NOTIFY (the one that
+ * transitions the phone's UI to "Conference" after Confrn succeeds) to be
+ * in-dialog with the original REFER — i.e. share Call-ID + From/To tags.
+ * An OOB NOTIFY against the contact URI is silently ignored. So instead
+ * of going through cisco_send_refer_response (which is OOB-friendly and
+ * adds Refer-Sub: false), we build the dialog ourselves and send the 202
+ * inside it, leaving the implicit subscription open for the NOTIFY.
+ *
+ * pjsip_dlg_create_uas_and_inc_lock returns the dialog already +1
+ * session-counted AND locked. We keep that session count past the 202
+ * (it's what holds the dialog alive while the task runs) and release the
+ * lock unconditionally on the way out. On any failure we explicitly
+ * release the session count (back to 0 — dialog will tear down) and
+ * return NULL so the caller can fall back to the OOB 202.
+ *
+ * \retval dlg with +1 session count held — caller must dec_session.
+ * \retval NULL on failure (already logged; nothing to release).
+ */
+static pjsip_dialog *conference_open_uas_dialog_and_202(pjsip_rx_data *rdata,
+	const char *endpoint_id)
+{
+	pjsip_dialog *dlg = NULL;
+	pjsip_tx_data *tdata = NULL;
+	int kept = 0;
+
+	if (pjsip_dlg_create_uas_and_inc_lock(pjsip_ua_instance(),
+			rdata, NULL, &dlg) != PJ_SUCCESS) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — pjsip_dlg_create_uas_and_inc_lock "
+			"failed for Confrn REFER; falling back to OOB 202 (merge "
+			"will run but phone UI won't transition)\n", endpoint_id);
+		return NULL;
+	}
+
+	if (pjsip_dlg_create_response(dlg, rdata, 202, NULL, &tdata)
+			== PJ_SUCCESS
+		&& pjsip_dlg_send_response(dlg, pjsip_rdata_get_tsx(rdata),
+			tdata) == PJ_SUCCESS) {
+		kept = 1;
+	} else {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — in-dialog 202 build/send failed; "
+			"phone UI will not transition\n", endpoint_id);
+	}
+
+	if (!kept) {
+		/* Release the +1 from create_uas_and_inc_lock so the dialog
+		 * doesn't leak. */
+		pjsip_dlg_dec_session(dlg, &conference_module);
+	}
+	pjsip_dlg_dec_lock(dlg);
+	return kept ? dlg : NULL;
+}
+
+/*!
  * \brief Build a 3-way multimix bridge from the two existing 1:1 bridges.
  *
  * The phone has two SIP dialogs at the moment Confrn is pressed:
@@ -702,37 +776,61 @@ static int conference_send_task(void *obj)
 		ast_channel_name(chan_phone_b));
 
 	/* Phone UI cue: Cisco firmware (CP-7975G/9.4.2 verified) needs an
-	 * Event: refer NOTIFY to transition its display from "active + held"
-	 * to "Conference" after Confrn succeeds — even though we sent
-	 * Refer-Sub: false on the 202 (which RFC 4488 says means "don't
-	 * expect a NOTIFY"). The chan_sip cisco-usecallmanager patch sends
-	 * an in-dialog NOTIFY for exactly this reason. We try the simpler
-	 * out-of-dialog pattern first (same shape as our Park-orbit NOTIFYs)
-	 * — Cisco firmware MAY correlate on Event:refer alone without
-	 * strict in-dialog matching. If it doesn't, we'll fall back to
-	 * pjsip_xfer_create_uas + an in-dialog NOTIFY in a follow-up. */
-	{
-		pjsip_tx_data *tdata = NULL;
+	 * Event:refer NOTIFY to transition the phone's display from
+	 * "active + held" to "Conference" after Confrn succeeds. RFC 4488
+	 * with Refer-Sub: false would say no NOTIFY is needed, but Cisco
+	 * firmware empirically ignores that and still wants the NOTIFY, and
+	 * specifically wants it in-dialog with the REFER (we tested with an
+	 * OOB NOTIFY first — phone display didn't update). The chan_sip
+	 * cisco-usecallmanager patch sends exactly this NOTIFY through the
+	 * dialog the REFER establishes.
+	 *
+	 * data->dlg was created at REFER receipt via pjsip_dlg_create_uas;
+	 * it holds Call-ID + From/To tags identical to the REFER. Build
+	 * NOTIFY in that dialog and send. Body shape matches chan_sip:
+	 * Event: refer, Subscription-State: active;expires=60, no body. */
+	if (data->dlg) {
+		pjsip_tx_data *notify_tdata = NULL;
+		pj_str_t notify_method_name = pj_str("NOTIFY");
+		pjsip_method notify_method;
 
-		if (!ast_sip_create_request("NOTIFY", NULL, data->endpoint,
-				NULL, data->contact, &tdata)) {
-			ast_sip_add_header(tdata, "Event", "refer");
-			ast_sip_add_header(tdata, "Subscription-State",
-				"active;expires=60");
-			if (ast_sip_send_request(tdata, NULL, data->endpoint,
-					NULL, NULL)) {
-				ast_log(LOG_WARNING,
-					"cisco-conference: %s — Conference NOTIFY "
-					"send failed for %s (bridge OK, phone UI may "
-					"not transition)\n",
+		pjsip_method_init_np(&notify_method, &notify_method_name);
+		pjsip_dlg_inc_lock(data->dlg);
+		if (pjsip_dlg_create_request(data->dlg, &notify_method, -1,
+				&notify_tdata) == PJ_SUCCESS) {
+			pj_str_t hdr_event_name    = pj_str("Event");
+			pj_str_t hdr_event_val     = pj_str("refer");
+			pj_str_t hdr_substate_name = pj_str("Subscription-State");
+			pj_str_t hdr_substate_val  = pj_str("active;expires=60");
+
+			pjsip_msg_add_hdr(notify_tdata->msg,
+				(pjsip_hdr *) pjsip_generic_string_hdr_create(
+					notify_tdata->pool, &hdr_event_name,
+					&hdr_event_val));
+			pjsip_msg_add_hdr(notify_tdata->msg,
+				(pjsip_hdr *) pjsip_generic_string_hdr_create(
+					notify_tdata->pool, &hdr_substate_name,
+					&hdr_substate_val));
+
+			if (pjsip_dlg_send_request(data->dlg, notify_tdata,
+					-1, NULL) == PJ_SUCCESS) {
+				ast_log(LOG_NOTICE,
+					"cisco-conference: %s — in-dialog Event:refer "
+					"NOTIFY sent to %s\n",
 					endpoint_id, data->contact->uri);
 			} else {
-				ast_log(LOG_NOTICE,
-					"cisco-conference: %s — Event:refer NOTIFY "
-					"sent to %s\n",
-					endpoint_id, data->contact->uri);
+				ast_log(LOG_WARNING,
+					"cisco-conference: %s — pjsip_dlg_send_request "
+					"failed for the Conference NOTIFY; phone UI "
+					"may not transition\n", endpoint_id);
 			}
+		} else {
+			ast_log(LOG_WARNING,
+				"cisco-conference: %s — pjsip_dlg_create_request "
+				"failed for the Conference NOTIFY; phone UI may "
+				"not transition\n", endpoint_id);
 		}
+		pjsip_dlg_dec_lock(data->dlg);
 	}
 
 cleanup:
@@ -754,12 +852,17 @@ cleanup:
 static void queue_conference(struct ast_sip_endpoint *endpoint,
 	struct ast_sip_contact *contact,
 	const struct conference_dialog_id *active_dialog,
-	const struct conference_dialog_id *consult_dialog)
+	const struct conference_dialog_id *consult_dialog,
+	pjsip_dialog *dlg)
 {
 	struct conference_task_data *data;
 
 	data = ao2_alloc(sizeof(*data), conference_task_data_destroy);
 	if (!data) {
+		/* Couldn't queue — must release the dialog ourselves. */
+		if (dlg) {
+			pjsip_dlg_dec_session(dlg, &conference_module);
+		}
 		return;
 	}
 	ao2_ref(endpoint, +1);
@@ -768,11 +871,12 @@ static void queue_conference(struct ast_sip_endpoint *endpoint,
 	data->contact = contact;
 	data->active_dialog  = *active_dialog;
 	data->consult_dialog = *consult_dialog;
+	data->dlg            = dlg;
 
 	if (ast_sip_push_task(conference_serializer, conference_send_task, data)) {
 		ast_log(LOG_WARNING,
 			"cisco-conference: failed to queue Conference task\n");
-		ao2_cleanup(data);
+		ao2_cleanup(data);   /* destructor releases dlg too */
 	}
 }
 
@@ -846,9 +950,18 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 			"(active callid=%s, consult callid=%s)\n",
 			endpoint_id, contact->uri,
 			msg.dialog_id.call_id, msg.consult_dialog_id.call_id);
-		cisco_send_refer_response(rdata, 202, endpoint);
-		queue_conference(endpoint, contact, &msg.dialog_id,
-			&msg.consult_dialog_id);
+		{
+			pjsip_dialog *dlg = conference_open_uas_dialog_and_202(
+				rdata, endpoint_id);
+
+			if (!dlg) {
+				/* Fallback: bridge still gets built; phone UI just
+				 * won't transition. We already logged why. */
+				cisco_send_refer_response(rdata, 202, endpoint);
+			}
+			queue_conference(endpoint, contact, &msg.dialog_id,
+				&msg.consult_dialog_id, dlg);
+		}
 		break;
 	default:
 		/* Compiler completeness — kind == NONE already returned above. */

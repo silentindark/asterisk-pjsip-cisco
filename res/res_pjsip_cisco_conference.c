@@ -123,12 +123,18 @@ struct conference_dialog_id {
 
 struct conflist_task_data {
 	struct ast_sip_endpoint *endpoint;
+	/* The specific contact that pressed ConfList. Captured at rx time
+	 * (rdata is gone by the time the task runs) and used to send the
+	 * menu REFER back to only that phone — not all contacts of a
+	 * shared-line AOR. */
+	struct ast_sip_contact *contact;
 	struct conference_dialog_id dialog_id;
 };
 
 static void conflist_task_data_destroy(void *obj)
 {
 	struct conflist_task_data *data = obj;
+	ao2_cleanup(data->contact);
 	ao2_cleanup(data->endpoint);
 }
 
@@ -315,7 +321,29 @@ static pjsip_msg_body *make_menu_body(pj_pool_t *pool, struct ast_channel *self,
 	}
 	ast_str_append(&menu, 0, MENU_FOOTER);
 
-	cisco_remotecc_multipart_add_part(pool, multipart, ast_str_buffer(menu));
+	/* The menu part uses application/x-cisco-remotecc-cm+xml, NOT the
+	 * shared helper's default application/x-cisco-remotecc-request+xml.
+	 * Cisco firmware looks at the second part's content-type to decide
+	 * whether to render the CiscoIPPhoneMenu; mislabelling it as
+	 * x-cisco-remotecc-request+xml silently drops the menu (which is
+	 * how this looked: REFER 202'd by firmware, no menu rendered). The
+	 * chan_sip patch (handle_remotecc_conflist) gets this right. So
+	 * inline pjsip_multipart_create_part here rather than using the
+	 * cisco_remotecc_multipart_add_part shared helper. */
+	{
+		pj_str_t menu_type    = pj_str("application");
+		pj_str_t menu_subtype = pj_str("x-cisco-remotecc-cm+xml");
+		pj_str_t menu_text;
+		pjsip_multipart_part *menu_part;
+
+		pj_strdup2(pool, &menu_text, ast_str_buffer(menu));
+		menu_part = pjsip_multipart_create_part(pool);
+		if (menu_part) {
+			menu_part->body = pjsip_msg_body_create(pool,
+				&menu_type, &menu_subtype, &menu_text);
+			pjsip_multipart_add_part(pool, multipart, menu_part);
+		}
+	}
 	ast_free(menu);
 
 	return multipart;
@@ -333,7 +361,8 @@ static pjsip_msg_body *conflist_build_adapter(pj_pool_t *pool, void *vctx)
 	return make_menu_body(pool, ctx->self, ctx->bridge, ctx->conference_id);
 }
 
-static void send_menu_to_contacts(struct ast_sip_endpoint *endpoint,
+static void send_menu_to_contact(struct ast_sip_endpoint *endpoint,
+	struct ast_sip_contact *contact,
 	struct ast_channel *self, struct ast_bridge *bridge,
 	unsigned int conference_id)
 {
@@ -344,12 +373,12 @@ static void send_menu_to_contacts(struct ast_sip_endpoint *endpoint,
 	};
 
 	ast_log(LOG_NOTICE,
-		"cisco-conference: pushing ConfList menu to %s\n",
-		ast_sorcery_object_get_id(endpoint));
+		"cisco-conference: pushing ConfList menu to %s @ %s\n",
+		ast_sorcery_object_get_id(endpoint), contact->uri);
 
-	cisco_endpoint_send_refer_to_all_contacts(endpoint,
+	cisco_endpoint_send_refer_to_contact(endpoint, contact,
 		"cisco-conference", "cisco-conflist", "ConfList menu",
-		conflist_build_adapter, &ctx, NULL, NULL);
+		conflist_build_adapter, &ctx);
 }
 
 static int conflist_send_task(void *obj)
@@ -402,7 +431,8 @@ static int conflist_send_task(void *obj)
 	 * counter shape. */
 	conference_id = (unsigned int)(uintptr_t) bridge;
 
-	send_menu_to_contacts(data->endpoint, channel, bridge, conference_id);
+	send_menu_to_contact(data->endpoint, data->contact,
+		channel, bridge, conference_id);
 
 cleanup:
 	ao2_cleanup(bridge);
@@ -413,6 +443,7 @@ cleanup:
 }
 
 static void queue_conflist(struct ast_sip_endpoint *endpoint,
+	struct ast_sip_contact *contact,
 	const struct conference_dialog_id *dialog_id)
 {
 	struct conflist_task_data *data;
@@ -424,6 +455,8 @@ static void queue_conflist(struct ast_sip_endpoint *endpoint,
 
 	ao2_ref(endpoint, +1);
 	data->endpoint = endpoint;
+	ao2_ref(contact, +1);
+	data->contact = contact;
 	data->dialog_id = *dialog_id;
 
 	if (ast_sip_push_task(conference_serializer, conflist_send_task, data)) {
@@ -470,12 +503,34 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 		return PJ_FALSE;
 	}
 
-	ast_log(LOG_NOTICE,
-		"cisco-conference: %s pressed ConfList (callid=%s)\n",
-		endpoint_id, dialog_id.call_id);
+	/* Capture WHICH contact pressed ConfList. The rdata's source IP:port
+	 * matches the host:port in exactly one of the endpoint's registered
+	 * contacts (the phone that sent the REFER). The follow-up menu REFER
+	 * goes back to that one only — otherwise on a shared line every phone
+	 * shows the same menu and the firmware presents it as confusion. */
+	{
+		struct ast_sip_contact *contact =
+			cisco_endpoint_find_contact_from_rdata(endpoint, rdata);
 
-	cisco_send_refer_response(rdata, 202, endpoint);
-	queue_conflist(endpoint, &dialog_id);
+		if (!contact) {
+			ast_log(LOG_NOTICE,
+				"cisco-conference: %s pressed ConfList but source "
+				"%s:%d doesn't match any registered contact — "
+				"can't target the response\n", endpoint_id,
+				rdata->pkt_info.src_name, rdata->pkt_info.src_port);
+			cisco_send_refer_response(rdata, 202, endpoint);
+			ao2_cleanup(endpoint);
+			return PJ_TRUE;
+		}
+
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s pressed ConfList from %s (callid=%s)\n",
+			endpoint_id, contact->uri, dialog_id.call_id);
+
+		cisco_send_refer_response(rdata, 202, endpoint);
+		queue_conflist(endpoint, contact, &dialog_id);
+		ao2_cleanup(contact);
+	}
 
 	ao2_cleanup(endpoint);
 	return PJ_TRUE;

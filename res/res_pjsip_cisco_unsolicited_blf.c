@@ -178,10 +178,26 @@ static int send_unsolicited_notify(struct ast_sip_endpoint *endpoint,
 		exten_state = AST_EXTENSION_UNAVAILABLE;
 	}
 
-	/* DND state lives in the hint's presence channel (set by chan_sip's
-	 * `sip donotdisturb` CLI or any ast_presence_state_changed source).
-	 * Query separately — extension state alone doesn't reflect it. */
-	presence_state = ast_hint_presence_state(NULL, context, exten, NULL, NULL);
+	/* DND state lives in the hint's presence channel (set by
+	 * cisco_dnd_set / res_pjsip_cisco_endpoint's PJSIP: provider, or
+	 * any ast_presence_state_changed source). Query separately —
+	 * extension state alone doesn't reflect it.
+	 *
+	 * presencestate.c:165 unconditionally dereferences the subtype/
+	 * message out-params (no NULL guard), so we MUST pass addresses of
+	 * real char* locals — passing NULL,NULL crashes any presence
+	 * lookup against a hint that has a non-empty presence component
+	 * (e.g. "PJSIP/1010,PJSIP:1010"). The strings, if any, are
+	 * allocated by the provider callback and we own them. */
+	{
+		char *p_subtype = NULL;
+		char *p_message = NULL;
+
+		presence_state = ast_hint_presence_state(NULL, context, exten,
+			&p_subtype, &p_message);
+		ast_free(p_subtype);
+		ast_free(p_message);
+	}
 	if (presence_state < 0) {
 		presence_state = AST_PRESENCE_NOT_SET;
 	}

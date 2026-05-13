@@ -701,6 +701,40 @@ static int conference_send_task(void *obj)
 		ast_channel_name(chan_remote_b),
 		ast_channel_name(chan_phone_b));
 
+	/* Phone UI cue: Cisco firmware (CP-7975G/9.4.2 verified) needs an
+	 * Event: refer NOTIFY to transition its display from "active + held"
+	 * to "Conference" after Confrn succeeds — even though we sent
+	 * Refer-Sub: false on the 202 (which RFC 4488 says means "don't
+	 * expect a NOTIFY"). The chan_sip cisco-usecallmanager patch sends
+	 * an in-dialog NOTIFY for exactly this reason. We try the simpler
+	 * out-of-dialog pattern first (same shape as our Park-orbit NOTIFYs)
+	 * — Cisco firmware MAY correlate on Event:refer alone without
+	 * strict in-dialog matching. If it doesn't, we'll fall back to
+	 * pjsip_xfer_create_uas + an in-dialog NOTIFY in a follow-up. */
+	{
+		pjsip_tx_data *tdata = NULL;
+
+		if (!ast_sip_create_request("NOTIFY", NULL, data->endpoint,
+				NULL, data->contact, &tdata)) {
+			ast_sip_add_header(tdata, "Event", "refer");
+			ast_sip_add_header(tdata, "Subscription-State",
+				"active;expires=60");
+			if (ast_sip_send_request(tdata, NULL, data->endpoint,
+					NULL, NULL)) {
+				ast_log(LOG_WARNING,
+					"cisco-conference: %s — Conference NOTIFY "
+					"send failed for %s (bridge OK, phone UI may "
+					"not transition)\n",
+					endpoint_id, data->contact->uri);
+			} else {
+				ast_log(LOG_NOTICE,
+					"cisco-conference: %s — Event:refer NOTIFY "
+					"sent to %s\n",
+					endpoint_id, data->contact->uri);
+			}
+		}
+	}
+
 cleanup:
 	/* Release our +1 ref on the conf bridge — channels imparted into it
 	 * hold their own refs, so it stays alive until DISSOLVE_EMPTY fires. */

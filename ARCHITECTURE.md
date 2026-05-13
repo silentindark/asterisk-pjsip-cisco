@@ -114,6 +114,19 @@ copy. Asterisk's per-module `.exports` linker scripts default to
 `local: *;` and reliably-exporting cross-module helpers is a fight
 with the build system.
 
+This module also registers the global `PJSIP` presence-state
+provider — the one a BLF hint reaches as `PJSIP:<endpoint>` in its
+presence component (second comma-separated half), e.g.
+`exten => 1010,hint,PJSIP/1010,PJSIP:1010`. The callback reads
+`DND/<endpoint>` from astdb and returns `AST_PRESENCE_DND` /
+`NOT_SET`; `cisco_dnd_set()` fires `ast_presence_state_changed` so
+toggles propagate to live watchers. Mirrors the chan_sip
+cisco-usecallmanager patch's `sip_presencestate`, but reachable from
+an out-of-tree module: the colon form (not `PJSIP/1010`) is required
+because core chan_pjsip's `ast_channel_tech` has no `.presencestate`
+callback and this project doesn't patch core. Non-Cisco endpoints
+report `NOT_SET` so the provider is inert for non-Cisco peers.
+
 ### res_pjsip_cisco_pidf_body_generator
 
 Two registrations under one `.so`:

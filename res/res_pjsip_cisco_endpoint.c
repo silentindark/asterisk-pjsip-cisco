@@ -219,12 +219,18 @@ static int load_module(void)
 
 	ast_sorcery_load_object(sorcery, "cisco");
 
-	/* Non-fatal: the sorcery type is the critical thing here; without
-	 * the provider, DND simply won't drive BLF lamps (it still gets
-	 * written to astdb / carried in bulkupdate bodies as before). */
+	/* Fatal: cisco_dnd_set() (cisco_endpoint.h) publishes presence
+	 * changes for "PJSIP:<endpoint>" unconditionally on every toggle,
+	 * which assumes this provider is the canonical answer for that
+	 * label. If registration failed, hint cold-cache lookups would
+	 * fall through to "no provider found" and BLF DND state would
+	 * desync from the cached publications — better to fail load than
+	 * ship that inconsistency. In practice the only failure mode is
+	 * calloc returning NULL at startup, which is fatal anyway. */
 	if (ast_presence_state_prov_add("PJSIP", cisco_dnd_presence_state)) {
-		ast_log(LOG_WARNING, "cisco_endpoint: could not register PJSIP "
-			"presence-state provider; DND state will not light BLF lamps\n");
+		ast_log(LOG_ERROR, "cisco_endpoint: could not register PJSIP "
+			"presence-state provider\n");
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	return AST_MODULE_LOAD_SUCCESS;

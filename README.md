@@ -285,10 +285,20 @@ watchers. The colon form is used (not `PJSIP/1010`) because core
 chan_pjsip has no presence-state callback and this project doesn't
 patch core; the colon reaches the registered provider instead. A hint
 that omits the presence half (`exten => 1010,hint,PJSIP/1010`) still
-shows in-use / ringing fine — it just won't ever show DND. If you flip
-`DND/<endpoint>` in astdb directly (not via the softkey or
-`cisco_dnd_set`), no presence change fires, so push one yourself or use
-the `pjsip cisco bulkupdate` CLI.
+shows in-use / ringing fine — it just won't ever show DND.
+
+If you flip `DND/<endpoint>` in astdb directly (not via the softkey or
+`cisco_dnd_set`), no presence change fires and watching lamps stay
+stale. To push the change to watchers, also set the matching presence
+provider in the same place you set the astdb key, e.g. from dialplan:
+
+```
+exten => *78,1,Set(DB(DND/${CALLERID(num)})=YES)
+ same =>      ,n,Set(PRESENCE_STATE(PJSIP:${CALLERID(num)})=dnd,,)
+```
+
+(The `pjsip cisco bulkupdate` CLI refreshes the phone's *own* line UI
+via REFER but does not push presence to other watchers.)
 
 ## Compatibility
 

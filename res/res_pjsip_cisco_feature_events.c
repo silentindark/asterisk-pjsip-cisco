@@ -120,6 +120,87 @@
 	<support_level>extended</support_level>
  ***/
 
+/*** DOCUMENTATION
+	<function name="CISCO_DND" language="en_US">
+		<synopsis>
+			Read or set the Cisco DND state for an endpoint.
+		</synopsis>
+		<syntax>
+			<parameter name="endpoint" required="true">
+				<para>The cisco endpoint id (must have a
+				[name] type=cisco section in pjsip.conf).</para>
+			</parameter>
+		</syntax>
+		<description>
+			<para>Read returns <literal>YES</literal> when DND is
+			enabled, an empty string otherwise.</para>
+			<para>Write accepts any boolean Asterisk understands
+			(<literal>on</literal>/<literal>off</literal>,
+			<literal>yes</literal>/<literal>no</literal>,
+			<literal>1</literal>/<literal>0</literal>,
+			<literal>true</literal>/<literal>false</literal>). Both
+			updates the <literal>DND/&lt;endpoint&gt;</literal> astdb
+			key and fires an
+			<literal>ast_presence_state_changed</literal> on the
+			<literal>PJSIP:&lt;endpoint&gt;</literal> provider, so any
+			BLF hint whose presence component is
+			<literal>PJSIP:&lt;endpoint&gt;</literal> re-NOTIFYs its
+			watchers and the lamp updates.</para>
+			<para>Use this from dialplan feature codes instead of
+			writing the astdb key directly with
+			<literal>DB()</literal>, which would skip the presence
+			push.</para>
+			<example title="Server-side DND toggle feature code">
+exten => *78,1,Set(CISCO_DND(${CALLERID(num)})=YES)
+ same =>      ,n,Playback(do-not-disturb&amp;activated)
+exten => *79,1,Set(CISCO_DND(${CALLERID(num)})=NO)
+ same =>      ,n,Playback(do-not-disturb&amp;de-activated)
+			</example>
+		</description>
+	</function>
+	<function name="CISCO_HUNTGROUP" language="en_US">
+		<synopsis>
+			Read or set the Cisco hunt-group login state for an endpoint.
+		</synopsis>
+		<syntax>
+			<parameter name="endpoint" required="true">
+				<para>The cisco endpoint id.</para>
+			</parameter>
+		</syntax>
+		<description>
+			<para>Read returns <literal>YES</literal> when the
+			endpoint is logged into its hunt group, empty
+			otherwise. Write takes a boolean and updates
+			<literal>HuntGroup/&lt;endpoint&gt;</literal> in astdb.
+			Pair with <literal>pjsip cisco bulkupdate</literal> (or
+			the matching CLI) to push the change back to the phone's
+			HLog softkey UI.</para>
+		</description>
+	</function>
+	<function name="CISCO_CALLFORWARD" language="en_US">
+		<synopsis>
+			Read or set the Cisco call-forward-all target for an endpoint.
+		</synopsis>
+		<syntax>
+			<parameter name="endpoint" required="true">
+				<para>The cisco endpoint id.</para>
+			</parameter>
+		</syntax>
+		<description>
+			<para>Read returns the current
+			<literal>CF/&lt;endpoint&gt;</literal> target (empty
+			when call-forward is off). Write to a non-empty target
+			to enable forwarding; write an empty value (or any
+			Asterisk-recognised false value: <literal>off</literal>,
+			<literal>no</literal>, <literal>0</literal>,
+			<literal>false</literal>) to clear it. Pair with
+			<literal>pjsip cisco bulkupdate</literal> (or the
+			matching CLI) to push the change back to the phone's
+			CFwdALL softkey UI.</para>
+		</description>
+	</function>
+ ***/
+
 #include "asterisk.h"
 
 #include <ctype.h>
@@ -134,6 +215,8 @@
 #include "asterisk/astobj2.h"
 #include "asterisk/time.h"
 #include "asterisk/xml.h"
+#include "asterisk/cli.h"
+#include "asterisk/pbx.h"
 #include "asterisk/res_pjsip.h"
 #include "asterisk/sorcery.h"
 
@@ -903,6 +986,110 @@ static struct ast_sip_endpoint_identifier cisco_mac_identifier = {
 	.identify_endpoint = cisco_mac_identify,
 };
 
+/* ----------------------------------------------------------------------
+ * Dialplan functions: CISCO_DND, CISCO_HUNTGROUP, CISCO_CALLFORWARD.
+ *
+ * Thin wrappers over the cisco_{dnd,huntgroup,cfwd}_{get,set,is_*}
+ * helpers in cisco_endpoint.h so dialplan feature codes can toggle the
+ * same astdb state the phone softkeys flip — and, for DND, take the
+ * matching presence-state push through cisco_dnd_set() so watching
+ * BLF lamps update without operator glue.
+ *
+ * Reading: returns "YES"/"" for DND/HuntGroup, the literal target
+ * string (or "") for CallForward.
+ * Writing DND/HuntGroup: any ast_true/ast_false value.
+ * Writing CallForward: empty / ast_false value clears the key; any
+ *   other value is stored verbatim as the forward target.
+ * ---------------------------------------------------------------------- */
+
+static int cisco_dnd_func_read(struct ast_channel *chan, const char *cmd,
+	char *data, char *buf, size_t buflen)
+{
+	if (ast_strlen_zero(data)) {
+		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+		return -1;
+	}
+	ast_copy_string(buf, cisco_dnd_is_enabled(data) ? "YES" : "", buflen);
+	return 0;
+}
+
+static int cisco_dnd_func_write(struct ast_channel *chan, const char *cmd,
+	char *data, const char *value)
+{
+	if (ast_strlen_zero(data)) {
+		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+		return -1;
+	}
+	cisco_dnd_set(data, ast_true(value));
+	return 0;
+}
+
+static struct ast_custom_function cisco_dnd_function = {
+	.name  = "CISCO_DND",
+	.read  = cisco_dnd_func_read,
+	.write = cisco_dnd_func_write,
+};
+
+static int cisco_huntgroup_func_read(struct ast_channel *chan, const char *cmd,
+	char *data, char *buf, size_t buflen)
+{
+	if (ast_strlen_zero(data)) {
+		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+		return -1;
+	}
+	ast_copy_string(buf, cisco_huntgroup_is_in(data) ? "YES" : "", buflen);
+	return 0;
+}
+
+static int cisco_huntgroup_func_write(struct ast_channel *chan, const char *cmd,
+	char *data, const char *value)
+{
+	if (ast_strlen_zero(data)) {
+		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+		return -1;
+	}
+	cisco_huntgroup_set(data, ast_true(value));
+	return 0;
+}
+
+static struct ast_custom_function cisco_huntgroup_function = {
+	.name  = "CISCO_HUNTGROUP",
+	.read  = cisco_huntgroup_func_read,
+	.write = cisco_huntgroup_func_write,
+};
+
+static int cisco_cfwd_func_read(struct ast_channel *chan, const char *cmd,
+	char *data, char *buf, size_t buflen)
+{
+	if (ast_strlen_zero(data)) {
+		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+		return -1;
+	}
+	cisco_cfwd_get(data, buf, buflen);
+	return 0;
+}
+
+static int cisco_cfwd_func_write(struct ast_channel *chan, const char *cmd,
+	char *data, const char *value)
+{
+	if (ast_strlen_zero(data)) {
+		ast_log(LOG_WARNING, "%s requires an endpoint id\n", cmd);
+		return -1;
+	}
+	/* Treat empty / false-y values as clear; anything else is the
+	 * forward target. ast_false catches off/no/0/false; an empty
+	 * string falls into the same bucket via ast_strlen_zero. */
+	cisco_cfwd_set(data,
+		(ast_strlen_zero(value) || ast_false(value)) ? NULL : value);
+	return 0;
+}
+
+static struct ast_custom_function cisco_cfwd_function = {
+	.name  = "CISCO_CALLFORWARD",
+	.read  = cisco_cfwd_func_read,
+	.write = cisco_cfwd_func_write,
+};
+
 static int load_module(void)
 {
 	/* Bring everything the request dispatcher depends on up first — the
@@ -947,6 +1134,22 @@ static int load_module(void)
 			"cisco-feature-events: failed to register pjsip module\n");
 		return AST_MODULE_LOAD_DECLINE;
 	}
+
+	/* Dialplan functions are non-fatal: the module's main job (handling
+	 * SUBSCRIBE/PUBLISH from the phone, MAC identification) keeps
+	 * working even if pbx-function registration trips. Any failure here
+	 * is logged at WARNING and the partial set rolled back. */
+	if (ast_custom_function_register(&cisco_dnd_function)
+		|| ast_custom_function_register(&cisco_huntgroup_function)
+		|| ast_custom_function_register(&cisco_cfwd_function)) {
+		ast_custom_function_unregister(&cisco_cfwd_function);
+		ast_custom_function_unregister(&cisco_huntgroup_function);
+		ast_custom_function_unregister(&cisco_dnd_function);
+		ast_log(LOG_WARNING,
+			"cisco-feature-events: failed to register CISCO_* dialplan "
+			"functions; SUBSCRIBE/PUBLISH paths still work\n");
+	}
+
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
@@ -960,6 +1163,9 @@ static int unload_module(void)
 	if (!ast_shutdown_final()) {
 		return -1;
 	}
+	ast_custom_function_unregister(&cisco_cfwd_function);
+	ast_custom_function_unregister(&cisco_huntgroup_function);
+	ast_custom_function_unregister(&cisco_dnd_function);
 	ast_sip_unregister_service(&cisco_feature_events_module);
 	ast_sip_unregister_endpoint_identifier(&cisco_mac_identifier);
 	ast_sip_unregister_endpoint_identifier(&cisco_authorization_identifier);

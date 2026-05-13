@@ -46,6 +46,15 @@
 			to apply Cisco-specific REGISTER-time behaviour to a
 			given endpoint, and to source per-endpoint values
 			(line_index, subscribe list).
+		</para><para>
+			Also registers a <literal>PJSIP</literal> presence-state
+			provider so a BLF hint can carry a line's DND state in its
+			presence component, e.g.
+			<literal>exten => 1010,hint,PJSIP/1010,PJSIP:1010</literal>.
+			The colon form (<literal>PJSIP:1010</literal>) reaches this
+			provider; the feature-events module fires a presence change
+			on every DND toggle so watching phones re-render the lamp.
+			Non-Cisco endpoints report <literal>NOT_SET</literal>.
 		</para></description>
 		<configFile name="pjsip.conf">
 			<configObject name="cisco">
@@ -112,9 +121,40 @@
 #include "asterisk/stringfields.h"
 #include "asterisk/astobj2.h"
 #include "asterisk/utils.h"
+#include "asterisk/presencestate.h"
 #include "asterisk/res_pjsip.h"
 
 #include "cisco_endpoint.h"
+
+/*
+ * Presence-state provider for DND. Lets a BLF hint of the form
+ *
+ *     exten => 1010,hint,PJSIP/1010,PJSIP:1010
+ *
+ * carry the watched line's DND state in its presence half (the second
+ * comma-separated component), the same way the chan_sip cisco-usecallmanager
+ * patch used SIP/<peer> there. We can't reuse the channel-tech "PJSIP/<id>"
+ * spelling for that — core chan_pjsip has no .presencestate callback and we
+ * don't patch core — so the hint uses a colon ("PJSIP:1010") to reach this
+ * registered provider instead of a slash. cisco_dnd_set() (cisco_endpoint.h)
+ * fires ast_presence_state_changed("PJSIP:<id>") on every toggle so live
+ * changes propagate; this callback answers the cold-cache / "core show hints"
+ * lookups. Endpoints with no [name] type=cisco section report NOT_SET so the
+ * provider is inert for non-Cisco peers.
+ */
+static enum ast_presence_state cisco_dnd_presence_state(const char *data,
+	char **subtype, char **message)
+{
+	struct cisco_endpoint *cisco;
+
+	cisco = cisco_endpoint_get(data);
+	if (!cisco) {
+		return AST_PRESENCE_NOT_SET;
+	}
+	ao2_cleanup(cisco);
+
+	return cisco_dnd_is_enabled(data) ? AST_PRESENCE_DND : AST_PRESENCE_NOT_SET;
+}
 
 static void cisco_endpoint_destructor(void *obj)
 {
@@ -179,6 +219,14 @@ static int load_module(void)
 
 	ast_sorcery_load_object(sorcery, "cisco");
 
+	/* Non-fatal: the sorcery type is the critical thing here; without
+	 * the provider, DND simply won't drive BLF lamps (it still gets
+	 * written to astdb / carried in bulkupdate bodies as before). */
+	if (ast_presence_state_prov_add("PJSIP", cisco_dnd_presence_state)) {
+		ast_log(LOG_WARNING, "cisco_endpoint: could not register PJSIP "
+			"presence-state provider; DND state will not light BLF lamps\n");
+	}
+
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
@@ -200,6 +248,7 @@ static int unload_module(void)
 	if (!ast_shutdown_final()) {
 		return -1;
 	}
+	ast_presence_state_prov_del("PJSIP");
 	return 0;
 }
 

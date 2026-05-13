@@ -33,6 +33,14 @@ subscribe_context = local_sip_phone
 
 ; DND behavior when DND/<endpoint> is enabled in astdb or toggled from
 ; the phone softkey. no = ring silently, yes = reject as busy.
+;
+; For a DND softkey press to also light the speed-dial lamps red on the
+; phones that watch this line, the watched extension's hint (in
+; extensions.conf) must carry the PJSIP:<endpoint> presence provider as
+; its second component, e.g.
+;   exten => 1010,hint,PJSIP/1010,PJSIP:1010
+; (same slot the chan_sip cisco-usecallmanager patch uses SIP/<peer>
+; for; colon, not slash — see README "DND on BLF lamps").
 dnd_busy         = no
 
 ; Comma-separated list of OTHER cisco-endpoint IDs that share the same

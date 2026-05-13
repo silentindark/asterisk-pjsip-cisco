@@ -266,6 +266,30 @@ to registered contacts. MCID resolves the XML `<dialogid>` to a live
 session via PJSIP's native `pjsip_ua_find_dialog` and queues
 `AST_CONTROL_MCID` on the bridged peer.
 
+### DND on BLF lamps
+
+For a DND softkey press to turn the watching phones' speed-dial lamps
+red, the **watched extension's hint must carry the `PJSIP:<endpoint>`
+presence-state provider as its second component** — the presence half,
+exactly where the chan_sip cisco-usecallmanager patch puts `SIP/<peer>`:
+
+```ini
+exten => 1010,hint,PJSIP/1010,PJSIP:1010
+```
+
+`res_pjsip_cisco_endpoint` registers that `PJSIP` provider (it reads
+`DND/<endpoint>` from astdb), and `cisco_dnd_set()` — the function the
+feature-events module calls on every softkey toggle — fires
+`ast_presence_state_changed` so `res_pjsip_exten_state` re-NOTIFYs the
+watchers. The colon form is used (not `PJSIP/1010`) because core
+chan_pjsip has no presence-state callback and this project doesn't
+patch core; the colon reaches the registered provider instead. A hint
+that omits the presence half (`exten => 1010,hint,PJSIP/1010`) still
+shows in-use / ringing fine — it just won't ever show DND. If you flip
+`DND/<endpoint>` in astdb directly (not via the softkey or
+`cisco_dnd_set`), no presence change fires, so push one yourself or use
+the `pjsip cisco bulkupdate` CLI.
+
 ## Compatibility
 
 - **Asterisk 22.9.x** — primary target; what the test bench runs on.

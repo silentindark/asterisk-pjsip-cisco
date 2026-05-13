@@ -38,6 +38,7 @@
 #include "asterisk/netsock2.h"
 #include "asterisk/res_pjsip.h"
 #include "asterisk/astdb.h"
+#include "asterisk/presencestate.h"
 #include "asterisk/xml.h"
 
 struct cisco_endpoint {
@@ -1061,6 +1062,20 @@ static inline void cisco_dnd_set(const char *endpoint_id, int enabled)
 	} else {
 		ast_db_del("DND", endpoint_id);
 	}
+
+	/* Surface the change to BLF watchers. A hint of the form
+	 *   exten => N,hint,PJSIP/N,PJSIP:N
+	 * picks this up through the "PJSIP" presence-state provider
+	 * res_pjsip_cisco_endpoint registers (see that module), and
+	 * res_pjsip_exten_state then NOTIFYs the watching phones — whose
+	 * Cisco firmware renders <ce:dnd/> as a red lamp. Mirrors the
+	 * chan_sip cisco-usecallmanager patch, which fired
+	 * ast_presence_state_changed from sip_handle_publish_presence and
+	 * the `sip donotdisturb` CLI. DND off reports NOT_SET rather than
+	 * AVAILABLE so this provider only ever adds the DND signal and never
+	 * masks another presence source '&'-combined into the same hint. */
+	ast_presence_state_changed(enabled ? AST_PRESENCE_DND : AST_PRESENCE_NOT_SET,
+		NULL, NULL, "PJSIP:%s", endpoint_id);
 }
 
 static inline int cisco_huntgroup_is_in(const char *endpoint_id)

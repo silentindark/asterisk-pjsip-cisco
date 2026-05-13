@@ -15,17 +15,18 @@
  * Wire shapes mirror the chan_sip cisco-usecallmanager patch's
  * channels/sip/conference.c:751 sip_conference_participants.
  *
- * Phase 1 is deliberately limited:
- *   - Mute / Remove / Update softkeys on the menu are NOT yet wired up.
- *     Those arrive as datapassthroughreq REFERs with applicationid=1
- *     (SIP_REMOTECC_CONF_LIST) and a <usercalldata> field; this module
- *     does not yet handle them and they fall through to the regular
- *     RemoteCC handler (which 603 Declines).
- *   - Confrn (3-way conference creation) is implemented as of phase 1b:
- *     parses the inbound REFER's <dialogid> + <consultdialogid>, resolves
- *     both to ast_sip_session, and stitches the two existing 1:1 bridges
- *     into one MULTIMIX bridge via ast_bridge_move. Join (multi-call
- *     merge via Select/Unselect) and RmLastConf are deferred.
+ * Coverage:
+ *   - ConfList softkey + Mute / Remove / Update / participant-pick
+ *     action softkeys (chan_sip's two-step state machine: a sticky
+ *     softkey REFER sets pending action; the next participant-pick
+ *     REFER applies it. Default action when no softkey was pressed
+ *     first is Mute, matching the patch).
+ *   - Confrn (3-way conference creation) is implemented in full,
+ *     including holdretrieve REFER + Cisco-flavoured completion NOTIFY,
+ *     connected-line "Conference" display token, explicit consult-anchor
+ *     softhangup, and the cisco_keep_conference initiator-hangup knob.
+ *   - Join (multi-call merge via Select/Unselect) and RmLastConf are
+ *     still deferred.
  *
  * Architecture:
  *   - Registers a pjsip_module at PJSIP_MOD_PRIORITY_APPLICATION - 2,
@@ -108,15 +109,33 @@
 	"    <URL>UserCallData:%d:0:%u:0:%d</URL>\n"                    \
 	"  </MenuItem>\n"
 
-/* Phase 1: prompt only. Mute/Remove/Update softkey items omitted —
- * adding them would be misleading because we don't yet handle the
- * usercalldata REFERs they would generate. */
-#define MENU_FOOTER                                                       \
-	"  <Prompt>Phase 1 (read-only)</Prompt>\n"                      \
+/* Chan_sip patch uses UserCallDataSoftKey:Select:... for the sticky
+ * action softkeys (the phone sends an "action-set" REFER, then on the
+ * next participant click an "apply" REFER) and UserCallDataSoftKey:
+ * Update:... for the one-shot menu refresh. confid is the bridge-derived
+ * synthetic id we put in <confid> in the part-1 echo above; the phone
+ * sends it back so callers correlate stateful traffic to a conference. */
+#define MENU_FOOTER_FMT                                                   \
+	"  <Prompt>Please select</Prompt>\n"                            \
 	"  <SoftKeyItem>\n"                                             \
 	"    <Name>Exit</Name>\n"                                       \
 	"    <Position>1</Position>\n"                                  \
 	"    <URL>SoftKey:Exit</URL>\n"                                 \
+	"  </SoftKeyItem>\n"                                            \
+	"  <SoftKeyItem>\n"                                             \
+	"    <Name>Remove</Name>\n"                                     \
+	"    <Position>2</Position>\n"                                  \
+	"    <URL>UserCallDataSoftKey:Select:%d:0:%u:0:Remove</URL>\n"  \
+	"  </SoftKeyItem>\n"                                            \
+	"  <SoftKeyItem>\n"                                             \
+	"    <Name>Mute</Name>\n"                                       \
+	"    <Position>3</Position>\n"                                  \
+	"    <URL>UserCallDataSoftKey:Select:%d:0:%u:0:Mute</URL>\n"    \
+	"  </SoftKeyItem>\n"                                            \
+	"  <SoftKeyItem>\n"                                             \
+	"    <Name>Update</Name>\n"                                     \
+	"    <Position>4</Position>\n"                                  \
+	"    <URL>UserCallDataSoftKey:Update:%d:0:%u:0:Update</URL>\n"  \
 	"  </SoftKeyItem>\n"                                            \
 	"</CiscoIPPhoneMenu>\n"
 
@@ -127,6 +146,159 @@ struct conference_dialog_id {
 	char local_tag[128];
 	char remote_tag[128];
 };
+
+/*!
+ * \brief Per-endpoint pending ConfList state, set when the phone presses
+ *        ConfList and consumed by subsequent action REFERs (which carry
+ *        no <dialogid> themselves, only <confid>).
+ *
+ * Two fields with different lifetimes:
+ *   dialog_id  — refreshed on every ConfList press, kept across action
+ *                REFERs. Lets the action handler relocate the conference
+ *                bridge via the same dialog → session → bridge path the
+ *                initial ConfList press uses.
+ *   action     — set when the phone presses the Mute/Remove softkey
+ *                ("sticky action"), consumed on the next participant
+ *                pick. Empty otherwise — chan_sip patch's default in
+ *                that case is Mute.
+ */
+struct conflist_pending {
+	char endpoint_id[128];
+	struct conference_dialog_id dialog_id;
+	int dialog_id_valid;
+	char action[16];  /* "" / "Mute" / "Remove" */
+};
+
+static struct ao2_container *conflist_pending_actions;
+#define CONFLIST_PENDING_BUCKETS 31
+
+static int conflist_pending_hash(const void *obj, int flags)
+{
+	const struct conflist_pending *p;
+	const char *id;
+
+	if (flags & OBJ_KEY) {
+		id = obj;
+	} else {
+		p = obj;
+		id = p->endpoint_id;
+	}
+	return ast_str_case_hash(id);
+}
+
+static int conflist_pending_cmp(void *obj, void *arg, int flags)
+{
+	const struct conflist_pending *l = obj;
+	const struct conflist_pending *r;
+	const char *id;
+
+	if (flags & OBJ_KEY) {
+		id = arg;
+	} else {
+		r = arg;
+		id = r->endpoint_id;
+	}
+	return strcasecmp(l->endpoint_id, id) ? 0 : CMP_MATCH | CMP_STOP;
+}
+
+/*!
+ * \brief Find-or-create the pending entry for \a endpoint_id. Returns the
+ *        entry with an extra ao2 ref the caller must release.
+ *
+ * The entry is left in the container so subsequent lookups see the
+ * latest state. Caller fills in fields under the entry's ao2 lock if
+ * concurrent access is possible.
+ */
+static struct conflist_pending *conflist_pending_get_or_create(
+	const char *endpoint_id)
+{
+	struct conflist_pending *p;
+
+	if (!conflist_pending_actions || ast_strlen_zero(endpoint_id)) {
+		return NULL;
+	}
+	p = ao2_find(conflist_pending_actions, endpoint_id, OBJ_KEY);
+	if (p) {
+		return p;
+	}
+	p = ao2_alloc(sizeof(*p), NULL);
+	if (!p) {
+		return NULL;
+	}
+	ast_copy_string(p->endpoint_id, endpoint_id, sizeof(p->endpoint_id));
+	ao2_link(conflist_pending_actions, p);
+	return p;
+}
+
+static void conflist_pending_set_dialog(const char *endpoint_id,
+	const struct conference_dialog_id *dialog_id)
+{
+	struct conflist_pending *p = conflist_pending_get_or_create(endpoint_id);
+	if (!p) {
+		return;
+	}
+	ao2_lock(p);
+	p->dialog_id = *dialog_id;
+	p->dialog_id_valid = 1;
+	ao2_unlock(p);
+	ao2_ref(p, -1);
+}
+
+static void conflist_pending_set_action(const char *endpoint_id,
+	const char *action)
+{
+	struct conflist_pending *p = conflist_pending_get_or_create(endpoint_id);
+	if (!p) {
+		return;
+	}
+	ao2_lock(p);
+	ast_copy_string(p->action, S_OR(action, ""), sizeof(p->action));
+	ao2_unlock(p);
+	ao2_ref(p, -1);
+}
+
+/*!
+ * \brief Look up the stored ConfList state for an endpoint.
+ *
+ * \param[out] out_dialog_id  Receives the saved dialog_id when present.
+ *                            May be NULL if caller only wants the action.
+ * \param[out] out_action     Receives the pending action (or empty), AND
+ *                            consumes it (clears the entry's action) so
+ *                            the next pick falls through to default-Mute.
+ *                            Pass NULL + 0 to peek without consuming.
+ * \retval 1 if a valid dialog_id was found.
+ * \retval 0 otherwise (no prior ConfList press from this endpoint).
+ */
+static int conflist_pending_lookup(const char *endpoint_id,
+	struct conference_dialog_id *out_dialog_id,
+	char *out_action, size_t out_action_len)
+{
+	struct conflist_pending *p;
+	int found_dialog;
+
+	if (out_action && out_action_len) {
+		out_action[0] = '\0';
+	}
+	if (!conflist_pending_actions || ast_strlen_zero(endpoint_id)) {
+		return 0;
+	}
+	p = ao2_find(conflist_pending_actions, endpoint_id, OBJ_KEY);
+	if (!p) {
+		return 0;
+	}
+	ao2_lock(p);
+	found_dialog = p->dialog_id_valid;
+	if (found_dialog && out_dialog_id) {
+		*out_dialog_id = p->dialog_id;
+	}
+	if (out_action && out_action_len) {
+		ast_copy_string(out_action, p->action, out_action_len);
+		p->action[0] = '\0';  /* consume — sticky action is one-shot */
+	}
+	ao2_unlock(p);
+	ao2_ref(p, -1);
+	return found_dialog;
+}
 
 struct conflist_task_data {
 	struct ast_sip_endpoint *endpoint;
@@ -200,14 +372,21 @@ static void conference_task_data_destroy(void *obj)
  */
 enum remotecc_softkey_kind {
 	REMOTECC_SOFTKEY_NONE = 0,
-	REMOTECC_SOFTKEY_CONFLIST,
-	REMOTECC_SOFTKEY_CONFERENCE,
+	REMOTECC_SOFTKEY_CONFLIST,        /* <softkeyeventmsg>ConfList */
+	REMOTECC_SOFTKEY_CONFERENCE,      /* <softkeyeventmsg>Conference */
+	/* A datapassthroughreq REFER carrying applicationid=1 and (in the
+	 * second multipart part) free-form user_call_data — chan_sip patch's
+	 * ConfList Mute/Remove/Update/<participant> two-step protocol. */
+	REMOTECC_SOFTKEY_CONFLIST_ACTION,
 };
 
 struct remotecc_softkey_msg {
 	enum remotecc_softkey_kind kind;
-	struct conference_dialog_id dialog_id;        /* always populated */
-	struct conference_dialog_id consult_dialog_id;/* Conference only */
+	struct conference_dialog_id dialog_id;        /* CONFLIST / CONFERENCE */
+	struct conference_dialog_id consult_dialog_id;/* CONFERENCE only */
+	/* CONFLIST_ACTION payload — sampled out of the inbound REFER body. */
+	unsigned int conf_id;
+	char user_call_data[64];
 };
 
 /*!
@@ -316,6 +495,126 @@ static int detect_remotecc_softkey(pjsip_msg_body *body,
 
 done:
 	ast_xml_close(doc);
+	return handled;
+}
+
+/*!
+ * \brief Parse a datapassthroughreq REFER and classify it as a ConfList
+ *        action (Mute / Remove / Update / select-participant).
+ *
+ * The REFER body shape is multipart/mixed:
+ *   part 1: application/x-cisco-remotecc-request+xml containing
+ *           <x-cisco-remotecc-request>
+ *             <datapassthroughreq>
+ *               <applicationid>1</applicationid>     (SIP_REMOTECC_CONF_LIST)
+ *               <confid>NNN</confid>
+ *             </datapassthroughreq>
+ *           </x-cisco-remotecc-request>
+ *   part 2: application/x-cisco-remotecc-cm+xml containing the raw
+ *           user_call_data string ("Mute", "Remove", "Update", or a
+ *           participant ordinal like "2").
+ *
+ * The first part we already have (the existing
+ * cisco_find_remotecc_request_body call surfaces it). The second part we
+ * walk the rdata's full multipart body to find. If applicationid != 1
+ * we let res_pjsip_cisco_remotecc handle it (it does callback, etc.).
+ *
+ * \retval 1 if this is a CONFLIST_ACTION REFER and \a out is populated.
+ * \retval 0 otherwise.
+ */
+static int detect_conflist_action(pjsip_rx_data *rdata, pjsip_msg_body *body,
+	struct remotecc_softkey_msg *out)
+{
+	struct ast_xml_doc *doc = NULL;
+	struct ast_xml_node *root;
+	struct ast_xml_node *dpt;
+	char appid[32];
+	char confid[32];
+	pjsip_msg_body *full_body;
+	pjsip_media_type cm_type;
+	pjsip_multipart_part *cm_part;
+	int handled = 0;
+
+	if (!body || body->len > CONFERENCE_MAX_BODY) {
+		return 0;
+	}
+
+	doc = cisco_xml_read_body(body);
+	if (!doc) {
+		return 0;
+	}
+
+	root = ast_xml_get_root(doc);
+	if (!root || strcasecmp(ast_xml_node_get_name(root),
+			"x-cisco-remotecc-request")) {
+		goto done;
+	}
+
+	dpt = ast_xml_find_element(ast_xml_node_get_children(root),
+		"datapassthroughreq", NULL, NULL);
+	if (!dpt) {
+		goto done;
+	}
+
+	if (!cisco_xml_copy_child_text(dpt, "applicationid", appid,
+			sizeof(appid))) {
+		goto done;
+	}
+	if (atoi(appid) != CONFERENCE_APP_ID_CONF_LIST) {
+		/* Not ours — remotecc.c handles other application_ids. */
+		goto done;
+	}
+	memset(out, 0, sizeof(*out));
+	out->kind = REMOTECC_SOFTKEY_CONFLIST_ACTION;
+
+	if (cisco_xml_copy_child_text(dpt, "confid", confid, sizeof(confid))) {
+		out->conf_id = (unsigned int) strtoul(confid, NULL, 10);
+	}
+
+	/* Now extract user_call_data from the second multipart part. The
+	 * phone always wraps datapassthroughreq in multipart/mixed; the
+	 * x-cisco-remotecc-cm+xml part's body is a plain ASCII string. */
+	full_body = rdata->msg_info.msg->body;
+	if (!full_body
+		|| !cisco_media_type_is(&full_body->content_type, "multipart",
+			"mixed")) {
+		/* No multipart wrapper — no user_call_data. Treat as a "menu
+		 * refresh" (empty user_call_data; queue_conflist_action_task
+		 * just re-emits the menu). */
+		handled = 1;
+		goto done;
+	}
+	pjsip_media_type_init2(&cm_type, "application",
+		"x-cisco-remotecc-cm+xml");
+	cm_part = pjsip_multipart_find_part(full_body, &cm_type, NULL);
+	if (cm_part && cm_part->body && cm_part->body->data
+		&& cm_part->body->len > 0
+		&& cm_part->body->len < (int) sizeof(out->user_call_data)) {
+		memcpy(out->user_call_data, cm_part->body->data,
+			cm_part->body->len);
+		out->user_call_data[cm_part->body->len] = '\0';
+		ast_trim_blanks(out->user_call_data);
+		/* ast_trim_blanks only NUL-terminates after trailing space; for
+		 * leading whitespace use ast_skip_blanks-equivalent pattern. */
+		{
+			char *p = out->user_call_data;
+			while (*p == ' ' || *p == '\t' || *p == '\r'
+				|| *p == '\n') {
+				p++;
+			}
+			if (p != out->user_call_data) {
+				memmove(out->user_call_data, p,
+					strlen(p) + 1);
+			}
+		}
+	}
+
+	handled = 1;
+
+done:
+	if (doc) {
+		ast_xml_close(doc);
+	}
 	return handled;
 }
 
@@ -432,7 +731,10 @@ static pjsip_msg_body *make_menu_body(pj_pool_t *pool, struct ast_channel *self,
 			"    <URL>SoftKey:Exit</URL>\n"
 			"  </MenuItem>\n");
 	}
-	ast_str_append(&menu, 0, MENU_FOOTER);
+	ast_str_append(&menu, 0, MENU_FOOTER_FMT,
+		CONFERENCE_APP_ID_CONF_LIST, conference_id,
+		CONFERENCE_APP_ID_CONF_LIST, conference_id,
+		CONFERENCE_APP_ID_CONF_LIST, conference_id);
 
 	/* The menu part uses application/x-cisco-remotecc-cm+xml, NOT the
 	 * shared helper's default application/x-cisco-remotecc-request+xml.
@@ -575,6 +877,206 @@ static void queue_conflist(struct ast_sip_endpoint *endpoint,
 	if (ast_sip_push_task(conference_serializer, conflist_send_task, data)) {
 		ast_log(LOG_WARNING,
 			"cisco-conference: failed to queue ConfList task\n");
+		ao2_cleanup(data);
+	}
+}
+
+/* ----------------------------------------------------------------------
+ * Phase 2: ConfList action softkeys — Mute / Remove / Update.
+ *
+ * Two-step state machine matching the chan_sip patch's
+ * sip_conference_participants:
+ *
+ *   1. Phone presses ConfList                → we emit menu.
+ *   2. Phone presses Remove/Mute softkey     → datapassthroughreq REFER
+ *      (user_call_data="Remove"/"Mute") — we STORE the action in
+ *      conflist_pending_actions keyed by endpoint and re-emit the menu.
+ *   3. Phone clicks a participant            → datapassthroughreq REFER
+ *      (user_call_data="<index>") — we CONSUME the pending action
+ *      (default Mute if none) and apply it to the matching bridge peer,
+ *      then re-emit the menu so the user sees updated state.
+ *
+ * "Update" is just a menu refresh (no action set, no apply).
+ * ---------------------------------------------------------------------- */
+
+struct conflist_action_task_data {
+	struct ast_sip_endpoint *endpoint;
+	struct ast_sip_contact *contact;
+	struct conference_dialog_id dialog_id; /* same shape as ConfList */
+	char user_call_data[64];
+};
+
+static void conflist_action_task_data_destroy(void *obj)
+{
+	struct conflist_action_task_data *data = obj;
+	ao2_cleanup(data->contact);
+	ao2_cleanup(data->endpoint);
+}
+
+/*!
+ * \brief Toggle mute on the bridge_channel that owns \a peer.
+ *
+ * \retval 0 on success (mute flag toggled, log line emitted)
+ * \retval -1 if peer has no bridge_channel (already left).
+ */
+static int apply_participant_mute(struct ast_channel *peer,
+	const char *endpoint_id)
+{
+	struct ast_bridge_channel *bc;
+	int now_muted;
+
+	bc = ast_channel_get_bridge_channel(peer);
+	if (!bc) {
+		return -1;
+	}
+	ast_bridge_channel_lock(bc);
+	bc->features->mute = !bc->features->mute;
+	now_muted = bc->features->mute;
+	ast_bridge_channel_unlock(bc);
+	ao2_ref(bc, -1);
+
+	ast_log(LOG_NOTICE,
+		"cisco-conference: %s — ConfList %s %s\n",
+		endpoint_id, now_muted ? "muted" : "unmuted",
+		ast_channel_name(peer));
+	return 0;
+}
+
+/*!
+ * \brief Pull \a peer out of the conference bridge. chan_pjsip's
+ *        teardown then BYE's the dialog.
+ */
+static int apply_participant_remove(struct ast_bridge *bridge,
+	struct ast_channel *peer, const char *endpoint_id)
+{
+	if (ast_bridge_remove(bridge, peer)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s — ConfList remove failed for %s "
+			"(channel may have already left)\n",
+			endpoint_id, ast_channel_name(peer));
+		return -1;
+	}
+	ast_log(LOG_NOTICE,
+		"cisco-conference: %s — ConfList removed %s from bridge\n",
+		endpoint_id, ast_channel_name(peer));
+	return 0;
+}
+
+static int conflist_action_send_task(void *obj)
+{
+	struct conflist_action_task_data *data = obj;
+	struct ast_sip_session *session;
+	struct ast_channel *channel = NULL;
+	struct ast_bridge *bridge = NULL;
+	struct ast_channel *target_peer = NULL;
+	const char *endpoint_id;
+	const char *ucd;
+	unsigned int conference_id;
+
+	endpoint_id = ast_sorcery_object_get_id(data->endpoint);
+	ucd         = data->user_call_data;
+
+	session = cisco_dialog_session_lookup(data->dialog_id.call_id,
+		data->dialog_id.local_tag, data->dialog_id.remote_tag);
+	if (!session) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s ConfList action for unknown dialog "
+			"(callid=%s)\n", endpoint_id, data->dialog_id.call_id);
+		goto cleanup;
+	}
+	channel = cisco_session_channel_ref(session);
+	if (!channel) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s ConfList action: dialog has no "
+			"channel\n", endpoint_id);
+		goto cleanup;
+	}
+	ast_channel_lock(channel);
+	bridge = ast_channel_get_bridge(channel);
+	ast_channel_unlock(channel);
+	if (!bridge) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s ConfList action: channel is not "
+			"in a bridge\n", endpoint_id);
+		goto cleanup;
+	}
+
+	/* Dispatch on user_call_data. */
+	if (!strcmp(ucd, "Mute") || !strcmp(ucd, "Remove")) {
+		/* Sticky softkey: remember which action the next participant
+		 * pick should trigger. */
+		conflist_pending_set_action(endpoint_id, ucd);
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s ConfList queued %s for next "
+			"participant pick\n", endpoint_id, ucd);
+	} else if (ast_strlen_zero(ucd) || !strcmp(ucd, "Update")) {
+		/* Just a menu refresh — nothing to do. */
+	} else {
+		/* Numeric participant index. chan_sip default: if no pending
+		 * action was set, treat as Mute. */
+		char action[16] = "";
+		int idx;
+
+		conflist_pending_lookup(endpoint_id, NULL, action,
+			sizeof(action));
+		if (ast_strlen_zero(action)) {
+			ast_copy_string(action, "Mute", sizeof(action));
+		}
+
+		idx = atoi(ucd);
+		target_peer = bridge_peer_channel_ref(channel, bridge, idx);
+		if (!target_peer) {
+			ast_log(LOG_NOTICE,
+				"cisco-conference: %s ConfList %s requested for "
+				"participant %d but that index isn't in the "
+				"bridge (someone left between menu emit and "
+				"click?)\n", endpoint_id, action, idx);
+		} else if (!strcmp(action, "Remove")) {
+			apply_participant_remove(bridge, target_peer,
+				endpoint_id);
+		} else {
+			/* Default + explicit Mute path */
+			apply_participant_mute(target_peer, endpoint_id);
+		}
+	}
+
+	/* Re-emit the menu so the user sees the post-action state. */
+	conference_id = (unsigned int)(uintptr_t) bridge;
+	send_menu_to_contact(data->endpoint, data->contact, channel, bridge,
+		conference_id);
+
+cleanup:
+	ast_channel_cleanup(target_peer);
+	ao2_cleanup(bridge);
+	ao2_cleanup(channel);
+	ao2_cleanup(session);
+	ao2_cleanup(data);
+	return 0;
+}
+
+static void queue_conflist_action(struct ast_sip_endpoint *endpoint,
+	struct ast_sip_contact *contact,
+	const struct conference_dialog_id *dialog_id,
+	const char *user_call_data)
+{
+	struct conflist_action_task_data *data;
+
+	data = ao2_alloc(sizeof(*data), conflist_action_task_data_destroy);
+	if (!data) {
+		return;
+	}
+	ao2_ref(endpoint, +1);
+	data->endpoint = endpoint;
+	ao2_ref(contact, +1);
+	data->contact = contact;
+	data->dialog_id = *dialog_id;
+	ast_copy_string(data->user_call_data,
+		S_OR(user_call_data, ""), sizeof(data->user_call_data));
+
+	if (ast_sip_push_task(conference_serializer, conflist_action_send_task,
+			data)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: failed to queue ConfList action task\n");
 		ao2_cleanup(data);
 	}
 }
@@ -1202,10 +1704,20 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 	ao2_cleanup(cisco);
 
 	body = cisco_find_remotecc_request_body(rdata);
-	if (!body || !detect_remotecc_softkey(body, &msg)
-		|| msg.kind == REMOTECC_SOFTKEY_NONE) {
+	if (!body) {
 		ao2_cleanup(endpoint);
 		return PJ_FALSE;
+	}
+
+	/* Try the softkeyeventmsg shape first (ConfList / Conference); if
+	 * that doesn't classify, try the datapassthroughreq shape
+	 * (ConfList action softkeys). One of the two must produce a non-NONE
+	 * kind, otherwise it's a body the remotecc module handles instead. */
+	if (!detect_remotecc_softkey(body, &msg) || msg.kind == REMOTECC_SOFTKEY_NONE) {
+		if (!detect_conflist_action(rdata, body, &msg)) {
+			ao2_cleanup(endpoint);
+			return PJ_FALSE;
+		}
 	}
 
 	/* Capture WHICH contact pressed the softkey. The rdata's source
@@ -1230,8 +1742,36 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 		ast_log(LOG_NOTICE,
 			"cisco-conference: %s pressed ConfList from %s (callid=%s)\n",
 			endpoint_id, contact->uri, msg.dialog_id.call_id);
+		/* Stash the active-call dialog so subsequent action REFERs
+		 * (which carry no <dialogid>, only <confid>) can relocate the
+		 * conference bridge. */
+		conflist_pending_set_dialog(endpoint_id, &msg.dialog_id);
 		cisco_send_refer_response(rdata, 202, endpoint);
 		queue_conflist(endpoint, contact, &msg.dialog_id);
+		break;
+	case REMOTECC_SOFTKEY_CONFLIST_ACTION:
+		{
+			struct conference_dialog_id stashed_dialog_id;
+
+			if (!conflist_pending_lookup(endpoint_id,
+					&stashed_dialog_id, NULL, 0)) {
+				ast_log(LOG_NOTICE,
+					"cisco-conference: %s sent a ConfList action "
+					"(usercalldata='%s') but no prior ConfList press "
+					"is on file — ignoring\n",
+					endpoint_id, msg.user_call_data);
+				cisco_send_refer_response(rdata, 202, endpoint);
+				break;
+			}
+			ast_log(LOG_NOTICE,
+				"cisco-conference: %s ConfList action from %s "
+				"(usercalldata='%s', confid=%u)\n",
+				endpoint_id, contact->uri,
+				msg.user_call_data, msg.conf_id);
+			cisco_send_refer_response(rdata, 202, endpoint);
+			queue_conflist_action(endpoint, contact,
+				&stashed_dialog_id, msg.user_call_data);
+		}
 		break;
 	case REMOTECC_SOFTKEY_CONFERENCE:
 		ast_log(LOG_NOTICE,
@@ -1278,7 +1818,18 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	conflist_pending_actions = ao2_container_alloc_hash(
+		AO2_ALLOC_OPT_LOCK_MUTEX, 0, CONFLIST_PENDING_BUCKETS,
+		conflist_pending_hash, NULL, conflist_pending_cmp);
+	if (!conflist_pending_actions) {
+		ast_taskprocessor_unreference(conference_serializer);
+		conference_serializer = NULL;
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
 	if (ast_sip_register_service(&conference_module)) {
+		ao2_cleanup(conflist_pending_actions);
+		conflist_pending_actions = NULL;
 		ast_taskprocessor_unreference(conference_serializer);
 		conference_serializer = NULL;
 		return AST_MODULE_LOAD_DECLINE;
@@ -1298,13 +1849,15 @@ static int unload_module(void)
 	}
 
 	ast_sip_unregister_service(&conference_module);
+	ao2_cleanup(conflist_pending_actions);
+	conflist_pending_actions = NULL;
 	ast_taskprocessor_unreference(conference_serializer);
 	conference_serializer = NULL;
 	return 0;
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER,
-	"PJSIP Cisco RemoteCC conference control (Phase 1: ConfList)",
+	"PJSIP Cisco RemoteCC conference control",
 	.support_level = AST_MODULE_SUPPORT_EXTENDED,
 	.load = load_module,
 	.unload = unload_module,

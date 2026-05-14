@@ -13,6 +13,9 @@ against CP7975G, CP8841, CP8861 and CP8865 on Asterisk 20.19, 22.9 and 23.3.
 - CFwdALL softkey — call-forward set/cancel, with the on-phone banner.
 - HLog softkey — hunt-group login/logout.
 - Park / ParkMonitor softkeys — native, via stock `res_parking`.
+- Record softkey — Start / Stop recording of the active call via
+  MixMonitor; per-call filename overridable from dialplan with the
+  `CISCO_RECORD_FILENAME` channel variable.
 - Conference softkeys: Confrn (3-way build), Join (multi-call merge),
   RmLastConf (remove most-recent participant), ConfList (read-only
   participant list).

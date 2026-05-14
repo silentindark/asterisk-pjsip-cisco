@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **Record softkey** (`StartRecording` / `StopRecording`) in
+  `res_pjsip_cisco_remotecc`. Resolves the softkey REFER's `<dialogid>`
+  to the phone's channel and runs `MixMonitor` (or `StopMixMonitor`) on
+  it off the SIP rx thread, defaulting to filename
+  `cisco-<endpoint>-<uniqueid>.wav` under the configured MixMonitor
+  directory. Override per call by setting `CISCO_RECORD_FILENAME` on
+  the channel from dialplan. chan_sip's `cisco-usecallmanager` patch
+  approaches the same softkey by creating a second SIP dialog and
+  dispatching to extension `record`; in chan_pjsip a direct MixMonitor
+  on the bridged channel gives the same result.
+
 ## v0.1.0 — 2026-05-13
 
 First tagged release — an early 0.x cut: works on the maintainer's

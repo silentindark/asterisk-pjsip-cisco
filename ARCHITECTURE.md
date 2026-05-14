@@ -357,6 +357,24 @@ unsubscribing on the terminal event. Mirrors chan_sip's
 parks via the blessed transfer API rather than `chan_sip`'s
 `sip_pvt`-internal park machinery.
 
+**StartRecording / StopRecording.** The softkey REFER carries
+`<dialogid>` for the call; `handle_record` resolves it to the phone's
+channel (same `cisco_dialog_session_lookup` → `cisco_session_channel_ref`
+path as Park), validates the channel is `AST_STATE_UP`, and queues an
+`ast_pbx_exec_application("MixMonitor", …)` (or `"StopMixMonitor"`)
+task on the shared `pjsip/cisco-remotecc` serializer so it never runs
+on the SIP rx thread. Default filename is
+`cisco-<endpoint>-<uniqueid>.wav` (resolved against the configured
+MixMonitor directory, normally `/var/spool/asterisk/monitor/`); the
+chan var `CISCO_RECORD_FILENAME` overrides it per call when set in
+dialplan before the softkey is pressed. The `b` MixMonitor option
+pauses recording when the channel isn't bridged. chan_sip's patch
+takes a different route — it creates a second SIP dialog back to the
+phone (connected-line "Record") and dispatches to dialplan extension
+`record` — which is necessary on chan_sip because there's no bridge to
+attach an audiohook to; on chan_pjsip the call is already on a bridge,
+so a direct MixMonitor on the phone's channel is the natural fit.
+
 Conference-related softkeys (Confrn / ConfList / Mute / Remove /
 Update / Select / Unselect / Join) are claimed by
 `res_pjsip_cisco_conference` at an earlier priority slot — see that

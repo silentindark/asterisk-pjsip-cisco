@@ -114,6 +114,12 @@ struct unsolicited_notify_payload {
 	char *exten;
 	int exten_state;
 	int presence_state;
+	/* True when endpoint has from_domain set — the From URI was built
+	 * from that FQDN by ast_sip_create_request, and the hook must leave
+	 * it alone. False for endpoints relying on transport-derived From,
+	 * where the hook calls ast_sip_rewrite_uri_to_local to swap the LAN
+	 * bind addr for external_signaling_address on non-local destinations. */
+	int skip_from_rewrite;
 };
 
 static void unsolicited_notify_payload_destroy(void *obj)
@@ -259,10 +265,53 @@ static char *build_cisco_pidf(const char *exten, const char *domain,
  * payload send_unsolicited_notify stashed; everyone else's traffic
  * passes through untouched.
  */
+/*
+ * Parse "host:port" (or bare "host") out of a URI parameter value, copy
+ * the host into the tdata pool, return 1 on success with port>0 set when
+ * a port was present. Returns 0 if the value is empty.
+ */
+static int unsolicited_parse_hostport(const pj_str_t *value, pj_pool_t *pool,
+	pj_str_t *out_host, int *out_port)
+{
+	int n = (int) value->slen;
+	const char *s = value->ptr;
+	int colon = -1;
+	int i;
+
+	if (n <= 0 || !s) {
+		return 0;
+	}
+	for (i = 0; i < n; i++) {
+		if (s[i] == ':') {
+			colon = i;
+			break;
+		}
+	}
+	if (colon >= 0) {
+		pj_str_t host = { (char *) s, colon };
+		pj_str_t port_str = { (char *) s + colon + 1, n - colon - 1 };
+
+		pj_strdup(pool, out_host, &host);
+		*out_port = (int) pj_strtoul(&port_str);
+	} else {
+		pj_str_t whole = { (char *) s, n };
+
+		pj_strdup(pool, out_host, &whole);
+		*out_port = 0;
+	}
+	return 1;
+}
+
 static pj_status_t unsolicited_tx_request(pjsip_tx_data *tdata)
 {
+	static const pj_str_t orig_host_name = { "x-ast-orig-host", 15 };
 	struct unsolicited_notify_payload *d;
 	pjsip_sip_uri *from_uri;
+	pjsip_sip_uri *ruri;
+	pjsip_param *orig_p;
+	pj_str_t orig_host = { NULL, 0 };
+	int orig_port = 0;
+	int orig_rewrite_applied = 0;
 	char domain_buf[PJSIP_MAX_URL_SIZE];
 	char *xml;
 	pj_str_t type;
@@ -281,6 +330,83 @@ static pj_status_t unsolicited_tx_request(pjsip_tx_data *tdata)
 	ast_sip_mod_data_set(tdata->pool, tdata->mod_data,
 		unsolicited_tx_module.id, MOD_DATA_UNSOLICITED_TX, NULL);
 
+	/* --- 1. Request-URI and To-URI host rewrite for NAT'd contacts ---
+	 *
+	 * When res_pjsip_nat saw a Contact whose URI host didn't match the
+	 * REGISTER's source IP (i.e. a NAT'd phone advertising its LAN
+	 * address), it rewrites the registered Contact's host:port to the
+	 * public mapping and stashes the original as
+	 * `x-ast-orig-host=LAN:port` on the URI (res_pjsip_nat.c:43-67).
+	 *
+	 * Cisco 88xx firmware on the WAN side rejects unsolicited NOTIFYs
+	 * whose Request-URI and To-URI use the public NAT mapping rather
+	 * than the host the phone last advertised about itself. Empirical:
+	 * NOTIFYs to 6030's LAN contact (192.168.18.69:port) get 200 OK;
+	 * the *same* watched-extension NOTIFY to the WAN contact
+	 * (61.245.143.111:port) gets 400 Bad Request. The phone's own
+	 * alarm payload echoes the rejected Request-URI verbatim, so the
+	 * firmware is matching on it.
+	 *
+	 * Fix: rewrite RURI and To-URI host:port to the x-ast-orig-host
+	 * value. PJSIP has already selected the public TCP transport for
+	 * this tdata by the time on_tx_request fires, so changing the URI
+	 * here only affects what gets serialised — not where the bytes
+	 * go. Strip the param from the wire-visible RURI for cleanliness.
+	 *
+	 * No-op when the param isn't there (LAN contact, no NAT rewrite
+	 * happened) — the LAN-side behaviour is unchanged.
+	 */
+	ruri = (pjsip_sip_uri *) pjsip_uri_get_uri(tdata->msg->line.req.uri);
+	if (ruri && (PJSIP_URI_SCHEME_IS_SIP(ruri)
+			|| PJSIP_URI_SCHEME_IS_SIPS(ruri))) {
+		orig_p = pjsip_param_find(&ruri->other_param, &orig_host_name);
+		if (orig_p
+			&& unsolicited_parse_hostport(&orig_p->value, tdata->pool,
+				&orig_host, &orig_port)) {
+			pj_strassign(&ruri->host, &orig_host);
+			ruri->port = orig_port;
+			pj_list_erase(orig_p);
+			orig_rewrite_applied = 1;
+		}
+	}
+	if (orig_rewrite_applied) {
+		pjsip_fromto_hdr *to_hdr =
+			(pjsip_fromto_hdr *) pjsip_msg_find_hdr(tdata->msg,
+				PJSIP_H_TO, NULL);
+
+		if (to_hdr && to_hdr->uri) {
+			pjsip_sip_uri *to_uri =
+				(pjsip_sip_uri *) pjsip_uri_get_uri(to_hdr->uri);
+
+			if (to_uri && (PJSIP_URI_SCHEME_IS_SIP(to_uri)
+					|| PJSIP_URI_SCHEME_IS_SIPS(to_uri))) {
+				pj_strassign(&to_uri->host, &orig_host);
+				to_uri->port = orig_port;
+				/* In case res_pjsip_nat populated To-URI's
+				 * x-ast-orig-host too (it doesn't currently,
+				 * but harmless to strip). */
+				while ((orig_p = pjsip_param_find(
+						&to_uri->other_param,
+						&orig_host_name))) {
+					pj_list_erase(orig_p);
+				}
+			}
+		}
+	}
+
+	/* --- 2. From-URI / PIDF rewrite (only when endpoint has no
+	 * from_domain configured) ---
+	 *
+	 * If from_domain is set, ast_sip_create_request put that FQDN in
+	 * the From URI and we leave it alone — that's the authoritative
+	 * server identity for the Cisco firmware. Otherwise rebuild From
+	 * to a destination-relative local address (the rewrite mirrors
+	 * what res_pjsip_nat does for Contact/Via) and rebuild the PIDF
+	 * body's entity= to match.
+	 */
+	if (d->skip_from_rewrite) {
+		return PJ_SUCCESS;
+	}
 	from_uri = cisco_tdata_from_sip_uri(tdata);
 	if (!from_uri) {
 		return PJ_SUCCESS;
@@ -288,15 +414,10 @@ static pj_status_t unsolicited_tx_request(pjsip_tx_data *tdata)
 	/* Core helper: copies the dialog/Contact-derived host into the URI,
 	 * then (when the destination is non-local on the selected
 	 * transport) replaces it with that transport's
-	 * external_signaling_address — same path res_pjsip_nat uses for
-	 * Contact and Via. Returns 0 in both the rewritten and
+	 * external_signaling_address. Returns 0 in both the rewritten and
 	 * not-rewritten cases; we just trust the result. */
 	ast_sip_rewrite_uri_to_local(from_uri, tdata);
 
-	/* Rebuild the PIDF body with the (possibly-rewritten) From URI's
-	 * host as the entity= domain — chan_sip put the same per-
-	 * destination ourip in both From and PIDF (line 1097 of the
-	 * patch); 88xx firmware appears to validate at least one of them. */
 	if (cisco_copy_sip_uri_hostport(from_uri, domain_buf,
 			sizeof(domain_buf))) {
 		return PJ_SUCCESS;
@@ -509,15 +630,25 @@ static int send_unsolicited_notify(struct ast_sip_endpoint *endpoint,
 		payload->exten = ast_strdup(exten);
 		payload->exten_state = exten_state;
 		payload->presence_state = presence_state;
+		payload->skip_from_rewrite =
+			!ast_strlen_zero(endpoint->fromdomain);
 		if (!payload->endpoint_id || !payload->contact_uri
 			|| !payload->exten) {
 			ao2_ref(payload, -1);
 			pjsip_tx_data_dec_ref(tdata);
 			return -1;
 		}
+		/* Always stash the hook payload — the hook does two
+		 * independent rewrites:
+		 *   - x-ast-orig-host RURI/To rewrite for NAT'd contacts
+		 *     (applies regardless of from_domain; no-op when the
+		 *     contact wasn't NAT-rewritten by res_pjsip_nat)
+		 *   - From URI / PIDF rewrite (only when from_domain is
+		 *     empty — see skip_from_rewrite above).
+		 */
 		ast_sip_mod_data_set(tdata->pool, tdata->mod_data,
-			unsolicited_tx_module.id, MOD_DATA_UNSOLICITED_TX,
-			payload);
+			unsolicited_tx_module.id,
+			MOD_DATA_UNSOLICITED_TX, payload);
 
 		if (ast_sip_send_request(tdata, NULL, endpoint, payload,
 				unsolicited_response_cb)) {

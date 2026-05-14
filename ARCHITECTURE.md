@@ -110,8 +110,8 @@ section is the gating signal for every other module.
 
 `cisco_endpoint_get()` and the other shared `cisco_*` helpers are
 declared in `res/cisco_endpoint.h` / `cisco_rdata.h` / `cisco_register.h`
-/ `cisco_refer.h` / `cisco_session.h` and defined in their sibling
-`.c` files. All five `.c` files are compiled into
+/ `cisco_refer.h` / `cisco_session.h` / `cisco_orig_host.h` and defined
+in their sibling `.c` files. All six `.c` files are compiled into
 `res_pjsip_cisco_endpoint.so`, which carries `AST_MODFLAG_GLOBAL_SYMBOLS`
 so its `cisco_*` exports (controlled by `res/res_pjsip_cisco_endpoint.exports`)
 are visible to every other module at load time. Same pattern stock
@@ -129,6 +129,31 @@ an out-of-tree module: the colon form (not `PJSIP/1010`) is required
 because core chan_pjsip's `ast_channel_tech` has no `.presencestate`
 callback and this project doesn't patch core. Non-Cisco endpoints
 report `NOT_SET` so the provider is inert for non-Cisco peers.
+
+A third registration: `cisco_orig_host_register()` (from
+`cisco_orig_host.c`) installs a global `pjsip_module` whose
+`on_tx_request` callback rewrites Request-URI and To-URI host:port
+back to the phone's self-advertised contact host whenever
+`res_pjsip_nat` has left an `x-ast-orig-host` URI parameter on the
+Contact-derived RURI (i.e. for a NAT'd registered contact). Without
+this rewrite, Cisco Enterprise firmware (verified against
+CP8861/14.1.1 and CP7975G/9.4.2) rejects unsolicited NOTIFYs and
+unsolicited REFERs to its WAN-side contact with `400 Bad Request` —
+the phone's own alarm payload echoes the rejected RURI verbatim, so
+the firmware is matching on it. The hook fires after PJSIP has
+selected the transport but before serialisation, so changing the
+URIs only affects the wire bytes, not where they're routed (the
+public TCP connection stays in use). Strict no-op when the URI has
+no `x-ast-orig-host` parameter, so LAN-registered contacts and
+trunk-bound traffic pass through untouched and no consumer module
+opts in — sending an out-of-dialog request to a NAT'd Cisco-phone
+contact is enough.
+
+This means `res_pjsip_cisco_unsolicited_blf`'s presence NOTIFYs and
+`res_pjsip_cisco_bulkupdate`'s REFERs (and any future Cisco-* module
+that targets a NAT'd contact) all inherit the rewrite by simply
+sending requests. The rewrite is wired structurally rather than
+plumbed per-module.
 
 ### res_pjsip_cisco_pidf_body_generator
 

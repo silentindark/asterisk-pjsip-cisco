@@ -183,9 +183,14 @@ GPL-2.0 — matches Asterisk's licence.
 
 ## Acknowledgements
 
-The Cisco-firmware reverse-engineering is Gareth Palmer's work, in his
-[`cisco-usecallmanager`](https://usecallmanager.nz) patch for `chan_sip`.
-The XML body shapes, REGISTER flow and post-REGISTER REFER mechanics
-here are line-mapped from his patched chan_sip source; this project's
-contribution is porting those behaviours to `chan_pjsip` as out-of-tree
-modules.
+This project rests on Gareth Palmer's work. His
+[`cisco-usecallmanager`](https://usecallmanager.nz) patch for `chan_sip`
+has been around — and actively maintained — for years, and is the
+reason any of this is possible. Cisco Enterprise SIP firmware is not
+documented anywhere public; the optionsind, bulkupdate, RemoteCC and
+Cisco PIDF body shapes used here all come from his careful work
+understanding what real phones expect on the wire. The XML, REGISTER
+flow and post-REGISTER REFER mechanics in this project are line-mapped
+from his patched `chan_sip`; what this project contributes is the port
+to `chan_pjsip` as out-of-tree modules, so deployments that have moved
+off `chan_sip` don't lose Cisco support.

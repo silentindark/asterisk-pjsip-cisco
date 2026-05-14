@@ -63,51 +63,25 @@
 
 static struct ast_taskprocessor *unsolicited_serializer;
 static struct ao2_container *unsolicited_addr_cache;
-static pjsip_module unsolicited_tx_module;	/* defined further down */
-
-/* mod_data dictionary key — Asterisk forwards the key to pj_hash_set
- * with PJ_HASH_KEY_STRING, so it must be a non-NULL C string. */
-#define MOD_DATA_UNSOLICITED_TX	"unsolicited_tx"
 
 /*
- * Per-NOTIFY payload, kept alive across the whole transaction.
- *
- * Two consumers:
- *   - unsolicited_tx_request reads `contact_uri` (indirectly, via the
- *     Request-URI on tdata) to apply the x-ast-orig-host rewrite for
- *     NAT'd contacts. The payload itself only needs to exist as a
- *     marker so the hook knows this is one of our NOTIFYs and not
- *     someone else's outbound traffic on the same module.
- *   - unsolicited_response_cb reads (endpoint_id, exten, contact_uri)
- *     to log non-2xx / timeout / transport-error outcomes. Without
- *     this log a NOTIFY rejection (e.g. Cisco 88xx answering 400) is
- *     invisible — only a tcpdump capture would reveal it.
+ * Per-NOTIFY payload, kept alive across the whole transaction so the
+ * response callback can identify which (endpoint, exten, contact)
+ * tuple a non-2xx response corresponds to. Without it the failed
+ * NOTIFY produces no log line at all — only a tcpdump capture would
+ * reveal the rejection. The callback turns silent BLF rejections
+ * into a visible NOTICE in messages.
  *
  * Ownership: the only ao2 ref is the one ast_sip_send_request gets
  * via its 'token' argument. PJSIP's internal send_request_cb wrapper
  * fires the user callback exactly once on transaction termination
  * (PJSIP_EVENT_TIMER / PJSIP_EVENT_TRANSPORT_ERROR / PJSIP_EVENT_RX_MSG
  * — see res_pjsip.c:1882-1928), which is where the payload is
- * released. The mod_data slot is a raw borrow the hook reads but
- * does not refcount.
- *
- * Why not have the hook own the ref: PJSIP only fires on_tx_request
- * synchronously when the transport is already resolved AND the send
- * doesn't return PJ_EPENDING. For an outbound NOTIFY to a TCP/TLS
- * contact whose connect hasn't completed, or any destination needing
- * DNS resolution, ast_sip_send_request returns success and the hook
- * fires later from the resolver/transport completion callback (see
- * pjproject's sip_transaction.c:2510 + 2579). If the caller released
- * the ref right after send_request, the hook would dereference freed
- * memory. Tying the lifetime to the transaction's terminal callback
- * covers both sync and async paths uniformly.
- *
- * The one case the response callback can't cover is synchronous
- * failure of ast_sip_send_request itself (it consumes tdata and
+ * released. Synchronous send_request failure consumes tdata and
  * returns -1 before any transaction is created, so the user callback
- * never fires) — send_unsolicited_notify manually dec_refs on that
- * path. Same convention every stock caller follows; see
- * res_pjsip_messaging.c:771-776 for the canonical pattern.
+ * never fires; send_unsolicited_notify dec_refs the token manually
+ * on that path. Matches stock callers — res_pjsip_messaging.c:771-776
+ * is the canonical pattern.
  */
 struct unsolicited_notify_payload {
 	char *endpoint_id;
@@ -237,156 +211,15 @@ static char *build_cisco_pidf(const char *exten, const char *domain,
 }
 
 /*
- * tx_request hook: rewrite the NOTIFY's Request-URI and To-URI host:port
- * to the phone's self-advertised LAN contact host (saved by
- * res_pjsip_nat as the x-ast-orig-host URI parameter at REGISTER time).
- * Cisco firmware on the WAN side rejects unsolicited NOTIFYs whose
- * RURI/To use the public NAT mapping rather than what the phone last
- * told us about itself. The rewrite has to happen at tx time, not at
- * create time, because PJSIP commits to a transport (and finalises the
- * tdata's wire-bound URI shape) only during the send chain.
- *
- * Filter to "our" NOTIFYs by checking ast_sip_mod_data_get for the
- * payload send_unsolicited_notify stashed; everyone else's traffic
- * passes through untouched.
- */
-/*
- * Parse "host:port" (or bare "host") out of a URI parameter value, copy
- * the host into the tdata pool, return 1 on success with port>0 set when
- * a port was present. Returns 0 if the value is empty.
- */
-static int unsolicited_parse_hostport(const pj_str_t *value, pj_pool_t *pool,
-	pj_str_t *out_host, int *out_port)
-{
-	int n = (int) value->slen;
-	const char *s = value->ptr;
-	int colon = -1;
-	int i;
-
-	if (n <= 0 || !s) {
-		return 0;
-	}
-	for (i = 0; i < n; i++) {
-		if (s[i] == ':') {
-			colon = i;
-			break;
-		}
-	}
-	if (colon >= 0) {
-		pj_str_t host = { (char *) s, colon };
-		pj_str_t port_str = { (char *) s + colon + 1, n - colon - 1 };
-
-		pj_strdup(pool, out_host, &host);
-		*out_port = (int) pj_strtoul(&port_str);
-	} else {
-		pj_str_t whole = { (char *) s, n };
-
-		pj_strdup(pool, out_host, &whole);
-		*out_port = 0;
-	}
-	return 1;
-}
-
-static pj_status_t unsolicited_tx_request(pjsip_tx_data *tdata)
-{
-	static const pj_str_t orig_host_name = { "x-ast-orig-host", 15 };
-	struct unsolicited_notify_payload *d;
-	pjsip_sip_uri *ruri;
-	pjsip_param *orig_p;
-	pj_str_t orig_host = { NULL, 0 };
-	int orig_port = 0;
-	int orig_rewrite_applied = 0;
-
-	d = ast_sip_mod_data_get(tdata->mod_data, unsolicited_tx_module.id,
-		MOD_DATA_UNSOLICITED_TX);
-	if (!d) {
-		return PJ_SUCCESS;
-	}
-	/* One-shot: clear the slot so retransmits (auth retry, PJSIP-level
-	 * retries) don't re-apply the rewrite (the URI param it consumes
-	 * has already been erased). Payload lifetime is held by the
-	 * response-callback token, not by this slot, so clearing does not
-	 * affect refcounting. */
-	ast_sip_mod_data_set(tdata->pool, tdata->mod_data,
-		unsolicited_tx_module.id, MOD_DATA_UNSOLICITED_TX, NULL);
-
-	/* When res_pjsip_nat saw a Contact whose URI host didn't match the
-	 * REGISTER's source IP (i.e. a NAT'd phone advertising its LAN
-	 * address), it rewrites the registered Contact's host:port to the
-	 * public mapping and stashes the original as
-	 * `x-ast-orig-host=LAN:port` on the URI (res_pjsip_nat.c:43-67).
-	 *
-	 * Cisco firmware on the WAN side (verified against CP8861/14.1.1
-	 * and CP7975G/9.4.2) rejects unsolicited NOTIFYs whose Request-URI
-	 * and To-URI use the public NAT mapping rather than the host the
-	 * phone last advertised about itself. The phone's own alarm
-	 * payload echoes the rejected Request-URI verbatim, so the
-	 * firmware is matching on it. Same firmware on a LAN contact (no
-	 * NAT rewrite happened) accepts the same NOTIFY content.
-	 *
-	 * Fix: rewrite RURI and To-URI host:port to the x-ast-orig-host
-	 * value. PJSIP has already selected the public TCP transport for
-	 * this tdata by the time on_tx_request fires, so changing the URI
-	 * here only affects what gets serialised — not where the bytes
-	 * go. Strip the param from the wire-visible RURI for cleanliness.
-	 *
-	 * No-op when the param isn't there (LAN contact, no NAT rewrite
-	 * happened) — local-path behaviour unchanged. */
-	ruri = (pjsip_sip_uri *) pjsip_uri_get_uri(tdata->msg->line.req.uri);
-	if (ruri && (PJSIP_URI_SCHEME_IS_SIP(ruri)
-			|| PJSIP_URI_SCHEME_IS_SIPS(ruri))) {
-		orig_p = pjsip_param_find(&ruri->other_param, &orig_host_name);
-		if (orig_p
-			&& unsolicited_parse_hostport(&orig_p->value, tdata->pool,
-				&orig_host, &orig_port)) {
-			pj_strassign(&ruri->host, &orig_host);
-			ruri->port = orig_port;
-			pj_list_erase(orig_p);
-			orig_rewrite_applied = 1;
-		}
-	}
-	if (orig_rewrite_applied) {
-		pjsip_fromto_hdr *to_hdr =
-			(pjsip_fromto_hdr *) pjsip_msg_find_hdr(tdata->msg,
-				PJSIP_H_TO, NULL);
-
-		if (to_hdr && to_hdr->uri) {
-			pjsip_sip_uri *to_uri =
-				(pjsip_sip_uri *) pjsip_uri_get_uri(to_hdr->uri);
-
-			if (to_uri && (PJSIP_URI_SCHEME_IS_SIP(to_uri)
-					|| PJSIP_URI_SCHEME_IS_SIPS(to_uri))) {
-				pj_strassign(&to_uri->host, &orig_host);
-				to_uri->port = orig_port;
-				/* In case res_pjsip_nat populated To-URI's
-				 * x-ast-orig-host too (it doesn't currently,
-				 * but harmless to strip). */
-				while ((orig_p = pjsip_param_find(
-						&to_uri->other_param,
-						&orig_host_name))) {
-					pj_list_erase(orig_p);
-				}
-			}
-		}
-	}
-
-	return PJ_SUCCESS;
-}
-
-static pjsip_module unsolicited_tx_module = {
-	.name           = { "cisco-unsolicited-blf-tx", 24 },
-	.id             = -1,
-	/* Application priority — pure header rewrite, no transaction
-	 * state inspection. Order vs. res_pjsip_nat doesn't matter:
-	 * ast_sip_rewrite_uri_to_local does its own transport lookup
-	 * rather than relying on Contact already being rewritten. */
-	.priority       = PJSIP_MOD_PRIORITY_APPLICATION,
-	.on_tx_request  = unsolicited_tx_request,
-};
-
-/*
  * Send a single unsolicited Event: presence NOTIFY to the phone for
  * the given watched extension.
+ *
+ * The Request-URI / To-URI rewrite for NAT'd contacts (so Cisco
+ * firmware on the WAN side stops 400-ing the NOTIFYs) is handled by
+ * the global on_tx_request hook in res_pjsip_cisco_endpoint.so. See
+ * res/cisco_orig_host.{c,h} — it applies to every outbound SIP
+ * request whose RURI carries an x-ast-orig-host parameter, so this
+ * module doesn't need to opt in.
  */
 static int send_unsolicited_notify(struct ast_sip_endpoint *endpoint,
 	struct ast_sip_contact *contact, const char *exten, const char *context)
@@ -548,13 +381,6 @@ static int send_unsolicited_notify(struct ast_sip_endpoint *endpoint,
 			pjsip_tx_data_dec_ref(tdata);
 			return -1;
 		}
-		/* Stash the payload so the on_tx_request hook can identify
-		 * this as one of our NOTIFYs and apply the x-ast-orig-host
-		 * RURI/To rewrite. No-op on the hook side when the contact
-		 * has no x-ast-orig-host param (LAN registrations). */
-		ast_sip_mod_data_set(tdata->pool, tdata->mod_data,
-			unsolicited_tx_module.id,
-			MOD_DATA_UNSOLICITED_TX, payload);
 
 		if (ast_sip_send_request(tdata, NULL, endpoint, payload,
 				unsolicited_response_cb)) {
@@ -952,18 +778,6 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
-	if (ast_sip_register_service(&unsolicited_tx_module)) {
-		ao2_cleanup(unsolicited_addr_cache);
-		unsolicited_addr_cache = NULL;
-		ao2_cleanup(ext_state_watchers);
-		ext_state_watchers = NULL;
-		ast_taskprocessor_unreference(unsolicited_serializer);
-		unsolicited_serializer = NULL;
-		ast_log(LOG_ERROR,
-			"cisco-unsolicited-blf: failed to register tx pjsip module\n");
-		return AST_MODULE_LOAD_DECLINE;
-	}
-
 	ast_sip_register_supplement(&unsolicited_supplement);
 	return AST_MODULE_LOAD_SUCCESS;
 }
@@ -977,7 +791,6 @@ static int unload_module(void)
 		return -1;
 	}
 	ast_sip_unregister_supplement(&unsolicited_supplement);
-	ast_sip_unregister_service(&unsolicited_tx_module);
 	ao2_cleanup(unsolicited_addr_cache);
 	unsolicited_addr_cache = NULL;
 	ao2_cleanup(ext_state_watchers);

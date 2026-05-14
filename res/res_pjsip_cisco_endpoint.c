@@ -134,6 +134,7 @@
 #include "asterisk/res_pjsip.h"
 
 #include "cisco_endpoint.h"
+#include "cisco_orig_host.h"
 
 /*
  * Presence-state provider for DND. Lets a BLF hint of the form
@@ -250,6 +251,18 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	/* Global on_tx_request hook that rewrites NAT'd contacts' RURI +
+	 * To-URI back to the phone's self-advertised host:port (saved by
+	 * res_pjsip_nat as the x-ast-orig-host URI parameter). No-op when
+	 * the parameter isn't present, so it costs nothing for LAN
+	 * contacts and trunk-bound traffic. See cisco_orig_host.h. */
+	if (cisco_orig_host_register()) {
+		ast_log(LOG_ERROR, "cisco_endpoint: could not register "
+			"cisco-orig-host-rewrite pjsip module\n");
+		ast_presence_state_prov_del("PJSIP");
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
@@ -271,6 +284,7 @@ static int unload_module(void)
 	if (!ast_shutdown_final()) {
 		return -1;
 	}
+	cisco_orig_host_unregister();
 	ast_presence_state_prov_del("PJSIP");
 	return 0;
 }

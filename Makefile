@@ -111,7 +111,8 @@ ENDPOINT_HELPER_OBJS := \
     res/cisco_rdata.o \
     res/cisco_register.o \
     res/cisco_refer.o \
-    res/cisco_session.o
+    res/cisco_session.o \
+    res/cisco_orig_host.o
 
 OBJS := $(addprefix res/,$(addsuffix .o,$(MODULES))) $(ENDPOINT_HELPER_OBJS)
 SOS  := $(addprefix res/,$(addsuffix .so,$(MODULES)))

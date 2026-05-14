@@ -358,11 +358,16 @@ unsubscribing on the terminal event. Mirrors chan_sip's
 parks via the blessed transfer API rather than `chan_sip`'s
 `sip_pvt`-internal park machinery.
 
-Other parsed softkeys (Confrn, Join, …) are deliberately returned as `603 Decline`
-until their Asterisk-side feature integrations are ported. Claiming
-those REFERs is still useful: it prevents stock PJSIP REFER transfer
-handling from trying to process Cisco RemoteCC bodies as ordinary call
-transfer requests.
+Conference-related softkeys (Confrn / ConfList / Mute / Remove /
+Update / Select / Unselect / Join) are claimed by
+`res_pjsip_cisco_conference` at an earlier priority slot — see that
+module's section below. `Cancel` is currently accepted as a no-op
+(server-side cancel of an in-progress operation is not yet wired —
+see the TODO in `handle_softkey_event`). Any other RemoteCC softkey
+this module sees and doesn't recognise gets `603 Decline`. Claiming
+those REFERs (rather than letting them fall through) is what stops
+stock PJSIP REFER transfer handling from trying to process Cisco
+RemoteCC bodies as ordinary call transfers.
 
 ### res_pjsip_cisco_call_extras
 
@@ -378,34 +383,48 @@ Call-Info for outbound calls to the phone.
 
 ### res_pjsip_cisco_conference
 
-Phase 1 conference control. Hooks into the same RemoteCC REFER stream
-as `res_pjsip_cisco_remotecc` but at a slot earlier in the pjsip
-module priority chain (`PJSIP_MOD_PRIORITY_APPLICATION - 2`), so it
-gets first crack at parsing the body. The only request shape it
-currently claims is `<softkeyeventmsg><softkeyevent>ConfList</…>`;
-everything else falls through to `res_pjsip_cisco_remotecc` unchanged.
+Cisco RemoteCC conference control. Hooks into the same incoming-REFER
+stream as `res_pjsip_cisco_remotecc` but at a slot earlier in the
+pjsip module priority chain (`PJSIP_MOD_PRIORITY_APPLICATION - 2`),
+so it gets first crack at parsing the body. Claims the
+conference-family softkey REFERs; everything else falls through to
+`res_pjsip_cisco_remotecc` unchanged.
 
-When ConfList arrives, it resolves the XML `<dialogid>` to an
-`ast_sip_session` via the shared `cisco_dialog_session_lookup` helper
-(in `cisco_session.h`, wrapping `pjsip_ua_find_dialog` +
-`ast_sip_dialog_get_session`), walks the resulting channel's bridge with
-`ast_bridge_peers`, and sends an unsolicited REFER back to the phone
-carrying a multipart body with a `<datapassthroughreq
-applicationid="1">` echo and a `<CiscoIPPhoneMenu>` populated with
-each peer's caller-id name. Body shapes mirror the chan_sip patch's
-`channels/sip/conference.c sip_conference_participants`.
+Resolves the XML `<dialogid>` on every REFER to an `ast_sip_session`
+via the shared `cisco_dialog_session_lookup` helper (in
+`cisco_session.h`, wrapping `pjsip_ua_find_dialog` +
+`ast_sip_dialog_get_session`), independent of the remotecc dialog
+registry — no cross-module symbol export needed.
 
-Bridge-agnostic: this works against any Asterisk bridge containing
-the phone's channel, not just Cisco-built ad-hoc conferences. A user
-in a `ConfBridge()` conference pressing ConfList sees the ConfBridge
-participants the same way.
+**ConfList + participant-pick action softkeys.** When ConfList
+arrives the module walks the channel's bridge with `ast_bridge_peers`
+and sends an unsolicited REFER back to the phone with a
+`<datapassthroughreq applicationid="1">` echo and a
+`<CiscoIPPhoneMenu>` listing each peer's caller-id name. Body shapes
+mirror chan_sip's `channels/sip/conference.c sip_conference_participants`.
+Bridge-agnostic — works against any Asterisk bridge containing the
+phone's channel, including `ConfBridge()`. Mute / Remove / Update /
+participant-pick action softkeys land via the chan_sip-style two-step
+state machine: a sticky softkey REFER sets the pending action, the
+next participant-pick REFER applies it; default action when no
+softkey was pressed first is Mute, matching the patch.
 
-Phase 1 is read-only. The Mute / Remove / Update softkeys on the
-returned menu surface as `<datapassthroughreq>` REFERs the conference
-module does not yet recognise; those currently fall through to the
-remotecc handler, which `603 Decline`s them. Phase 2 will add Confrn
-(build a conference from the active 2-party call), then Phase 3 Join
-+ Select, then Phase 4 RmLastConf / multi-admin / keep-conference.
+**Confrn** (build a 3-way conference from the active 2-party call) is
+fully wired: holdretrieve REFER + Cisco-flavoured completion NOTIFY,
+the connected-line "Conference" display token, the explicit
+consult-anchor softhangup, and the `cisco_keep_conference` knob that
+controls what happens when the initiator hangs up first.
+
+**Select / Unselect / Join** (multi-call merge) — Select adds a
+dialog to a per-endpoint selected-calls list, Unselect removes it,
+Join (pressed on the active call) merges the active call's phone-side
+plus each selected call's remote-side into a single multimix bridge
+and softhangs the selected calls' phone-side anchors. Cleanup is a
+single OOB REFER with `<notifyreq><feature>Join</feature>
+<status>Complete</status>` targeting the active dialog.
+
+`RmLastConf` (remove the most recently joined party from a conference)
+is the named remaining gap — still deferred.
 
 ## Build system
 
@@ -441,25 +460,18 @@ line-mapped back to a function in
 
 ## What's deliberately NOT here
 
-Out of scope for this project (for now):
+Known remaining feature gaps (RemoteCC softkeys whose Asterisk-side
+integration hasn't been ported):
 
-- **The conference-building RemoteCC softkeys** — Confrn (build a
-  conference from the active 2-party call), Join (merge a held call /
-  another conference in), and Select + Direct Transfer (merge two held
-  calls). Plain blind/attended transfer via the `Trnsfer` softkey
-  already works through stock `chan_pjsip` REFER handling, and **Park /
-  ParkMonitor** are now implemented (see
-  `res_pjsip_cisco_remotecc` below — blind-transfer the peer to
-  `res_parking`'s parkext); this is the remaining subset CallManager
-  drives via `x-cisco-remotecc-request+xml` REFERs, where the server has
-  to parse the softkey XML, do the channel surgery (ConfBridge /
-  bridge-transfer), and REFER back to the phone to keep its
-  call-appearance UI in sync. `res_pjsip_cisco_remotecc` parses these
-  and `603 Decline`s the unimplemented ones; `res_pjsip_cisco_conference`
-  is the Phase-1 scaffold for the conference side (read-only ConfList).
-  Replaceable for fleets that accept the UX change by dialplan codes
-  (`*8` to pickup, `*0<ext>` for a chained-transfer conference).
+- **`RmLastConf`** — remove the most recently joined party from a
+  conference. The rest of the conference family (Confrn, ConfList +
+  action softkeys, Select / Unselect / Join) is implemented; this is
+  the named remaining piece. Currently falls through to
+  `res_pjsip_cisco_remotecc`'s `603 Decline`.
+- **`Cancel` server-side cancellation** — the softkey is accepted
+  (200 OK to the REFER) but the implied "cancel my in-progress
+  operation on the server" hasn't been wired through. Tracked by the
+  TODO at `handle_softkey_event` in `res_pjsip_cisco_remotecc.c`.
 
-If/when this becomes needed it's an additive module that slots in
-alongside the existing ones without redesign — same supplement /
-register-service / pubsub pattern.
+Each is additive — same supplement / register-service / pubsub
+pattern as the existing modules; no redesign required when picked up.

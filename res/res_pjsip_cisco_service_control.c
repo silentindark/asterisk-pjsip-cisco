@@ -75,6 +75,7 @@
 #include "asterisk/sorcery.h"
 
 #include "cisco_endpoint.h"
+#include "cisco_rdata.h"
 
 enum sc_action {
 	SC_CHECK_SYNC,

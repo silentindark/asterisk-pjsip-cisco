@@ -167,6 +167,8 @@ exten => *79,1,Set(CISCO_DND(${CALLERID(num)})=NO)
 #include "asterisk/sorcery.h"
 
 #include "cisco_endpoint.h"
+#include "cisco_refer.h"
+#include "cisco_register.h"
 
 /*
  * Per-part XML format strings. The three parts together get wrapped

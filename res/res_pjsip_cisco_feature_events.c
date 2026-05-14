@@ -142,6 +142,7 @@
 #include "asterisk/sorcery.h"
 
 #include "cisco_endpoint.h"
+#include "cisco_rdata.h"
 
 #define FEATURE_EVENT_MAX_BODY 8192
 #define DND_PUBLISH_MAX_BODY 4096

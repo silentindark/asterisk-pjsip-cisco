@@ -58,6 +58,8 @@
 #include "asterisk/sorcery.h"
 
 #include "cisco_endpoint.h"
+#include "cisco_rdata.h"
+#include "cisco_register.h"
 
 static struct ast_taskprocessor *unsolicited_serializer;
 static struct ao2_container *unsolicited_addr_cache;

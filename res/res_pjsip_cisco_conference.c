@@ -76,6 +76,8 @@
 #include "asterisk/sorcery.h"
 
 #include "cisco_endpoint.h"
+#include "cisco_rdata.h"
+#include "cisco_refer.h"
 #include "cisco_session.h"
 
 /* application_id values mirror the chan_sip patch's

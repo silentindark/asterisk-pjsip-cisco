@@ -79,6 +79,8 @@
 #include "asterisk/sorcery.h"
 
 #include "cisco_endpoint.h"
+#include "cisco_rdata.h"
+#include "cisco_refer.h"
 #include "cisco_session.h"
 
 #define REMOTECC_MAX_BODY 8192

@@ -42,6 +42,7 @@
 #include "asterisk/sorcery.h"
 
 #include "cisco_endpoint.h"
+#include "cisco_rdata.h"
 #include "cisco_session.h"
 
 #define CISCO_SIS_SUPPORTED "X-cisco-sis-10.0.0"

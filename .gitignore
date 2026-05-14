@@ -20,3 +20,6 @@ debian/*.debhelper.log
 *~
 .vscode/
 .idea/
+
+# Claude Code agent worktrees and run-time state
+.claude/

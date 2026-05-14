@@ -2,7 +2,7 @@
 
 Out-of-tree Asterisk modules that add Cisco Enterprise SIP firmware
 support to stock `chan_pjsip` — no Asterisk core patches. Bench-tested
-against CP7975G, CP8841, CP8861 and CP8865 on Asterisk 22.9.
+against CP7975G, CP8841, CP8861 and CP8865 on Asterisk 22.9 and 23.3.
 
 ## What works
 
@@ -161,7 +161,7 @@ print-and-stick user reference card live in
 
 | Asterisk  | Status                                                |
 |-----------|-------------------------------------------------------|
-| 23        | Builds clean, CI'd; not yet bench-tested on a phone.  |
+| 23        | Builds clean, CI'd; bench-tested against real phones. |
 | 22 (LTS)  | Primary target; bench-tested against real phones.     |
 | 21        | Not supported (EOL).                                  |
 | 20 (LTS)  | Builds clean, CI'd; not yet bench-tested on a phone.  |

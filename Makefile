@@ -131,6 +131,21 @@ all: check-headers $(SOS) $(DOC_XML)
 # Every .o depends on every cisco_*.h — they're small headers and a
 # header change is rare enough that universal rebuild is the right
 # trade-off.
+#
+# Helper objects (cisco_*.c, *not* res_pjsip_cisco_*.c) get the more-
+# specific rule below: they're linked into res_pjsip_cisco_endpoint.so
+# and any asterisk macro that expands to AST_MODULE_SELF (e.g.
+# ast_datastore_alloc, ast_calloc_with_stringfields) needs to resolve
+# to the endpoint module's __internal_..._self symbol, not the
+# helper's own basename. Without the override, helpers using such
+# macros emit unresolved-symbol link errors in the .so.
+res/cisco_%.o: res/cisco_%.c $(wildcard res/cisco_*.h)
+	$(CC) $(CFLAGS) \
+	    -UAST_MODULE_SELF_SYM \
+	    -DAST_MODULE_SELF_SYM=__internal_res_pjsip_cisco_endpoint_self \
+	    -DAST_MODULE=\"res_pjsip_cisco_endpoint\" \
+	    -c $< -o $@
+
 res/%.o: res/%.c $(wildcard res/cisco_*.h)
 	$(CC) $(CFLAGS) -DAST_MODULE=\"$*\" -c $< -o $@
 

@@ -798,7 +798,7 @@ static int unload_module(void)
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER,
-	"PJSIP Cisco as-feature-event SUBSCRIBE handler (DND / call-forward softkey)",
+	"PJSIP Cisco DND PUBLISH handler + MAC-address From-URI identifier",
 	.support_level = AST_MODULE_SUPPORT_EXTENDED,
 	.load = load_module,
 	.unload = unload_module,

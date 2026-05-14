@@ -68,4 +68,47 @@ struct ast_sip_session *cisco_dialog_session_lookup(
 void cisco_send_refer_response(pjsip_rx_data *rdata, int code,
 	struct ast_sip_endpoint *endpoint);
 
+struct ast_bridge;
+
+/*!
+ * \brief Mark this channel as just-joined a Cisco conference.
+ *
+ * Attaches (or refreshes) a small datastore on the channel carrying
+ * the current wall-clock timestamp. `cisco_conf_find_last_joined`
+ * later uses these timestamps to identify the most-recently-joined
+ * participant for the RmLastConf softkey — chan_sip mirrors the same
+ * semantics via the LIFO insertion order of its
+ * `sip_conference->participants` list.
+ *
+ * Idempotent: re-marking a channel that already carries the
+ * datastore updates the timestamp in place. No-op if \a chan is
+ * NULL.
+ *
+ * Conference modules should call this immediately after a successful
+ * `ast_bridge_move(conf, src, remote_leg, …)` — only for remote
+ * participants the conference creator is bringing in, NOT for the
+ * conference owner's own phone-side anchor.
+ */
+void cisco_conf_mark_joined(struct ast_channel *chan);
+
+/*!
+ * \brief Find the most-recently-joined participant in a bridge.
+ *
+ * Walks the bridge's channel snapshot, picks the one with the
+ * highest `cisco_conf_mark_joined` timestamp, optionally skipping
+ * \a exclude (the channel that pressed the softkey — typically the
+ * conference owner's phone-side leg, which should not remove itself).
+ *
+ * Untracked channels (no `cisco_conf_mark_joined` datastore) are
+ * ignored — they presumably joined this bridge via a stock path
+ * (ConfBridge, plain transfer) that the Cisco conference module
+ * never saw, and treating them as candidates would surprise the
+ * user.
+ *
+ * \retval ref-bumped channel; caller must \c ast_channel_unref()
+ * \retval NULL when the bridge contains no tracked candidates
+ */
+struct ast_channel *cisco_conf_find_last_joined(struct ast_bridge *bridge,
+	struct ast_channel *exclude);
+
 #endif /* _RES_PJSIP_CISCO_SESSION_H */

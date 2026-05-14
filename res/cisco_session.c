@@ -13,10 +13,14 @@
 #include <pjsip_ua.h>
 
 #include "asterisk/astobj2.h"
+#include "asterisk/bridge.h"
 #include "asterisk/channel.h"
+#include "asterisk/datastore.h"
 #include "asterisk/res_pjsip.h"
 #include "asterisk/res_pjsip_session.h"
 #include "asterisk/strings.h"
+#include "asterisk/time.h"
+#include "asterisk/utils.h"
 
 #include "cisco_session.h"
 
@@ -90,4 +94,117 @@ void cisco_send_refer_response(pjsip_rx_data *rdata, int code,
 	} else {
 		ast_sip_send_stateful_response(rdata, tdata, endpoint);
 	}
+}
+
+/* ---- conference join-time tracking (RmLastConf support) ---- */
+
+/* Datastore payload: a single timeval representing when the channel
+ * was added to its current Cisco conference. Tiny (~16 bytes), one
+ * per tracked channel. */
+static void cisco_conf_join_time_destroy(void *data)
+{
+	ast_free(data);
+}
+
+static const struct ast_datastore_info cisco_conf_join_time_info = {
+	.type = "cisco-conf-join-time",
+	.destroy = cisco_conf_join_time_destroy,
+};
+
+void cisco_conf_mark_joined(struct ast_channel *chan)
+{
+	struct ast_datastore *ds;
+	struct timeval *payload;
+
+	if (!chan) {
+		return;
+	}
+
+	ast_channel_lock(chan);
+	ds = ast_channel_datastore_find(chan, &cisco_conf_join_time_info, NULL);
+	if (ds && ds->data) {
+		*(struct timeval *) ds->data = ast_tvnow();
+		ast_channel_unlock(chan);
+		return;
+	}
+	ast_channel_unlock(chan);
+
+	/* New attachment. Allocate outside the channel lock — ast_calloc
+	 * may sleep, and the datastore add is the only step that needs
+	 * the lock. */
+	payload = ast_calloc(1, sizeof(*payload));
+	if (!payload) {
+		return;
+	}
+	*payload = ast_tvnow();
+
+	ds = ast_datastore_alloc(&cisco_conf_join_time_info, NULL);
+	if (!ds) {
+		ast_free(payload);
+		return;
+	}
+	ds->data = payload;
+
+	ast_channel_lock(chan);
+	if (ast_channel_datastore_add(chan, ds)) {
+		ast_channel_unlock(chan);
+		/* add() failure: the datastore's destroy callback won't run
+		 * because the datastore was never attached, so we have to
+		 * free the payload + datastore ourselves. */
+		ast_datastore_free(ds);
+		return;
+	}
+	ast_channel_unlock(chan);
+}
+
+struct ast_channel *cisco_conf_find_last_joined(struct ast_bridge *bridge,
+	struct ast_channel *exclude)
+{
+	struct ao2_container *peers;
+	struct ao2_iterator iter;
+	struct ast_channel *chan;
+	struct ast_channel *best = NULL;
+	struct timeval best_time = { 0, 0 };
+
+	if (!bridge) {
+		return NULL;
+	}
+
+	peers = ast_bridge_peers(bridge);
+	if (!peers) {
+		return NULL;
+	}
+
+	iter = ao2_iterator_init(peers, 0);
+	while ((chan = ao2_iterator_next(&iter))) {
+		struct ast_datastore *ds;
+		struct timeval *t;
+
+		if (exclude && chan == exclude) {
+			ast_channel_unref(chan);
+			continue;
+		}
+
+		ast_channel_lock(chan);
+		ds = ast_channel_datastore_find(chan,
+			&cisco_conf_join_time_info, NULL);
+		t = ds ? (struct timeval *) ds->data : NULL;
+		if (t && ast_tvcmp(*t, best_time) > 0) {
+			best_time = *t;
+			ast_channel_unlock(chan);
+			if (best) {
+				ast_channel_unref(best);
+			}
+			/* Transfer the iterator's ref to `best`; the loop's
+			 * uniform unref-on-drop happens via the else below. */
+			best = chan;
+			continue;
+		}
+		ast_channel_unlock(chan);
+		ast_channel_unref(chan);
+	}
+	ao2_iterator_destroy(&iter);
+	ao2_ref(peers, -1);
+
+	return best;
 }

@@ -1424,6 +1424,7 @@ static int join_send_task(void *obj)
 			ast_channel_name(chan_remote_active));
 		goto cleanup;
 	}
+	cisco_conf_mark_joined(chan_remote_active);
 
 	/* Now walk the selected list: for each one, UNHOLD its remote bridge
 	 * peer, move the remote into conf, and softhangup the phone-side
@@ -1494,6 +1495,7 @@ static int join_send_task(void *obj)
 				"selected remote leg %s; skipping\n",
 				endpoint_id, ast_channel_name(chan_remote_sel));
 		} else {
+			cisco_conf_mark_joined(chan_remote_sel);
 			joined_count++;
 		}
 
@@ -1951,6 +1953,7 @@ static int conference_send_task(void *obj)
 			"hang up to recover.\n", endpoint_id);
 		goto cleanup;
 	}
+	cisco_conf_mark_joined(chan_remote_a);
 
 	indicate_remote_unhold(chan_remote_b, endpoint_id, "consult remote leg");
 	if (ast_bridge_move(conf, bridge_b, chan_remote_b, NULL, 1)) {
@@ -1960,6 +1963,7 @@ static int conference_send_task(void *obj)
 			"hang up to recover.\n", endpoint_id);
 		goto cleanup;
 	}
+	cisco_conf_mark_joined(chan_remote_b);
 
 	if (ast_softhangup(chan_phone_b, AST_SOFTHANGUP_EXPLICIT)) {
 		ast_log(LOG_WARNING,

@@ -46,9 +46,19 @@ Missing any of (2)–(4) silently downgrades the buttons. The module set supplie
 
 Existence of a `[name] type=cisco` sorcery section (defined by `res_pjsip_cisco_endpoint`, schema in `res/cisco_endpoint.h`) is the **single gating signal** for every Cisco-specific behaviour in the other modules. A non-Cisco endpoint with no parallel `type=cisco` section falls through every supplement/hook unchanged. The PIDF body generator (`res_pjsip_cisco_pidf_body_generator`) is the deliberate exception — it's global and emits Cisco-flavoured PIDF for any presence subscriber, since non-Cisco UAs ignore the extra RPID elements.
 
-### No cross-module symbol exports
+### Shared helpers live in `res_pjsip_cisco_endpoint.so`
 
-Asterisk's per-module `.exports` linker scripts default to `local: *;` (every symbol hidden). Rather than fight that to share helpers, the convention here is: **shared logic lives in `static inline` functions in `res/cisco_endpoint.h` or `res/cisco_session.h`**, and each consuming module compiles its own copy. New cross-module helpers should follow the same pattern; do not export symbols from `res_pjsip_cisco_endpoint.so`.
+Same pattern stock Asterisk uses for `ast_sip_*` (defined in `res_pjsip.so`, called from every PJSIP submodule):
+
+- The five topical headers under `res/` — `cisco_endpoint.h`, `cisco_rdata.h`, `cisco_register.h`, `cisco_refer.h`, `cisco_session.h` — contain **declarations only** (struct definitions, typedefs, function prototypes).
+- The bodies live in sibling `.c` files (`res/cisco_endpoint.c`, `cisco_rdata.c`, `cisco_register.c`, `cisco_refer.c`, `cisco_session.c`) which **compile into `res_pjsip_cisco_endpoint.so`** alongside the module entry point.
+- `res_pjsip_cisco_endpoint.c`'s `AST_MODULE_INFO` carries `AST_MODFLAG_GLOBAL_SYMBOLS` so Asterisk's loader (which defaults to `RTLD_LOCAL`) re-opens the module with `RTLD_GLOBAL` and makes its symbols visible to subsequent `dlopen`s.
+- `res/res_pjsip_cisco_endpoint.exports` lists `cisco_*` as `global:`. Every other module's `.exports` has `local: *;` only. The Makefile passes `-Wl,--version-script=res/<module>.exports` for every `.so`, so the export set is enforced.
+- Module load order is governed by each consumer's `AST_MODULE_INFO.requires` field — they list `res_pjsip_cisco_endpoint`, which guarantees the helpers are resolvable by the time a consumer loads.
+
+To add a new shared helper: declare it in the topical `.h`, define it in the sibling `.c`. It picks up the `cisco_*` export glob automatically. No need to touch `.exports` unless the helper name doesn't start with `cisco_`.
+
+The grouping into topical headers (rather than one big shared `.h`) is for readability — split by concern: endpoint state, REGISTER tracking, REFER sending, rdata/URI/XML utilities, session/dialog lookup. Cross-cisco header dependencies are: `rdata.h` → `endpoint.h`; `register.h` → `rdata.h` (transitively `endpoint.h`); `refer.h` and `session.h` are independent.
 
 ### Module loading & PIDF body-generator slot
 

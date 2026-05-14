@@ -108,11 +108,14 @@ This avoids needing to extend `struct ast_sip_endpoint` (which would
 require patching Asterisk core). Existence of a `[name] type=cisco`
 section is the gating signal for every other module.
 
-The `cisco_endpoint_get()` helper lives `static inline` in
-`res/cisco_endpoint.h` so each consuming module compiles its own
-copy. Asterisk's per-module `.exports` linker scripts default to
-`local: *;` and reliably-exporting cross-module helpers is a fight
-with the build system.
+`cisco_endpoint_get()` and the other shared `cisco_*` helpers are
+declared in `res/cisco_endpoint.h` / `cisco_rdata.h` / `cisco_register.h`
+/ `cisco_refer.h` / `cisco_session.h` and defined in their sibling
+`.c` files. All five `.c` files are compiled into
+`res_pjsip_cisco_endpoint.so`, which carries `AST_MODFLAG_GLOBAL_SYMBOLS`
+so its `cisco_*` exports (controlled by `res/res_pjsip_cisco_endpoint.exports`)
+are visible to every other module at load time. Same pattern stock
+`res_pjsip.so` uses to publish `ast_sip_*` to every PJSIP submodule.
 
 This module also registers the global `PJSIP` presence-state
 provider — the one a BLF hint reaches as `PJSIP:<endpoint>` in its

@@ -35,13 +35,16 @@
  *     inline on the rx thread — line-mapped from chan_sip's park_thread —
  *     which left the parker leg stuck and could wedge the phone.)
  *
- * Stubbed — accepted on the wire (202) but no Asterisk-side action yet:
- *   - softkeyeventmsg Cancel. Should cancel the in-progress operation
- *     identified by <dialogid> (e.g. a transfer the user started but
- *     hasn't completed). Needs an active-session lookup via
- *     cisco_dialog_session_lookup() plus the corresponding
- *     ast_sip_session_terminate / channel-side cancel. See the TODO
- *     at handle_softkey_event.
+ * Ack-only (202, no server-side action — matches chan_sip):
+ *   - softkeyeventmsg Cancel. The chan_sip patch's dispatch-level
+ *     Cancel handler is a bare 202 with no logic; the phone uses it
+ *     as a UI-state signal when backing out of a softkey-driven flow,
+ *     and the server just needs to acknowledge the REFER. (Feature-
+ *     specific cancel semantics, like dismissing a queued CallBack,
+ *     live inside the relevant feature handler — usercalldata="Cancel"
+ *     in chan_sip's handle_remotecc_callback — not at the dispatch
+ *     level. We don't implement CallBack, so no feature-level Cancel
+ *     branch exists in this module.)
  *
  * Other RemoteCC softkeys are parsed and declined with 603 until their
  * underlying Asterisk integrations are ported.
@@ -1122,19 +1125,11 @@ static int handle_softkey_event(struct ast_sip_endpoint *endpoint,
 	}
 
 	if (!strcmp(softkey, "Cancel")) {
-		/* TODO: Cancel is currently a stub. The phone expects the
-		 * server to cancel the in-progress operation identified by
-		 * <dialogid> (typically a half-completed transfer). To do
-		 * that properly we need to look up the active session via
-		 * cisco_dialog_session_lookup(dialog_id->...) and drive a
-		 * cancel through ast_sip_session — neither of which is
-		 * wired up yet. We accept (202) so the firmware doesn't
-		 * surface an error to the user, but the in-flight operation
-		 * is not actually cancelled server-side. */
-		ast_log(LOG_NOTICE,
-			"cisco-remotecc: %s sent Cancel softkey (accepted as no-op; "
-			"server-side cancel not yet implemented)\n",
-			endpoint_id);
+		/* chan_sip parity (patch line 5767): dispatch-level Cancel is
+		 * a bare 202 with no server-side action. The phone uses this
+		 * softkey as a UI-state signal when leaving a softkey-driven
+		 * flow; any feature-level cancel semantics live inside the
+		 * relevant feature handler, not here. */
 		return 202;
 	}
 

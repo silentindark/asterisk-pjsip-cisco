@@ -468,13 +468,15 @@ line-mapped back to a function in
 
 ## What's deliberately NOT here
 
-Known remaining feature gaps (RemoteCC softkeys whose Asterisk-side
-integration hasn't been ported):
+`CallBack` (auto-callback when a busy party becomes free) — the
+chan_sip patch implements a small state machine that watches a target
+peer's registration / device-state and pushes an `<initiatecallreq>`
+REFER back to the requester when it transitions. Useful but rarely
+used in practice; ports as an additive module without redesign when
+needed. Same supplement / register-service / pubsub pattern as the
+existing modules.
 
-- **`Cancel` server-side cancellation** — the softkey is accepted
-  (200 OK to the REFER) but the implied "cancel my in-progress
-  operation on the server" hasn't been wired through. Tracked by the
-  TODO at `handle_softkey_event` in `res_pjsip_cisco_remotecc.c`.
-
-Additive when picked up — same supplement / register-service /
-pubsub pattern as the existing modules; no redesign required.
+Within CallBack, the phone's `usercalldata="Cancel"` sub-action would
+destroy the queued callback — a feature-level cancel that lives
+inside the CallBack handler. (The dispatch-level `softkeyevent="Cancel"`
+is a bare 202 in chan_sip too — no server-side action there.)

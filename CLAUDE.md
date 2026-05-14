@@ -50,15 +50,17 @@ Existence of a `[name] type=cisco` sorcery section (defined by `res_pjsip_cisco_
 
 Same pattern stock Asterisk uses for `ast_sip_*` (defined in `res_pjsip.so`, called from every PJSIP submodule):
 
-- The five topical headers under `res/` — `cisco_endpoint.h`, `cisco_rdata.h`, `cisco_register.h`, `cisco_refer.h`, `cisco_session.h` — contain **declarations only** (struct definitions, typedefs, function prototypes).
-- The bodies live in sibling `.c` files (`res/cisco_endpoint.c`, `cisco_rdata.c`, `cisco_register.c`, `cisco_refer.c`, `cisco_session.c`) which **compile into `res_pjsip_cisco_endpoint.so`** alongside the module entry point.
+- The six topical headers under `res/` — `cisco_endpoint.h`, `cisco_rdata.h`, `cisco_register.h`, `cisco_refer.h`, `cisco_session.h`, `cisco_orig_host.h` — contain **declarations only** (struct definitions, typedefs, function prototypes).
+- The bodies live in sibling `.c` files (`res/cisco_endpoint.c`, `cisco_rdata.c`, `cisco_register.c`, `cisco_refer.c`, `cisco_session.c`, `cisco_orig_host.c`) which **compile into `res_pjsip_cisco_endpoint.so`** alongside the module entry point.
 - `res_pjsip_cisco_endpoint.c`'s `AST_MODULE_INFO` carries `AST_MODFLAG_GLOBAL_SYMBOLS` so Asterisk's loader (which defaults to `RTLD_LOCAL`) re-opens the module with `RTLD_GLOBAL` and makes its symbols visible to subsequent `dlopen`s.
 - `res/res_pjsip_cisco_endpoint.exports` lists `cisco_*` as `global:`. Every other module's `.exports` has `local: *;` only. The Makefile passes `-Wl,--version-script=res/<module>.exports` for every `.so`, so the export set is enforced.
 - Module load order is governed by each consumer's `AST_MODULE_INFO.requires` field — they list `res_pjsip_cisco_endpoint`, which guarantees the helpers are resolvable by the time a consumer loads.
 
 To add a new shared helper: declare it in the topical `.h`, define it in the sibling `.c`. It picks up the `cisco_*` export glob automatically. No need to touch `.exports` unless the helper name doesn't start with `cisco_`.
 
-The grouping into topical headers (rather than one big shared `.h`) is for readability — split by concern: endpoint state, REGISTER tracking, REFER sending, rdata/URI/XML utilities, session/dialog lookup. Cross-cisco header dependencies are: `rdata.h` → `endpoint.h`; `register.h` → `rdata.h` (transitively `endpoint.h`); `refer.h` and `session.h` are independent.
+The grouping into topical headers (rather than one big shared `.h`) is for readability — split by concern: endpoint state, REGISTER tracking, REFER sending, rdata/URI/XML utilities, session/dialog lookup. Cross-cisco header dependencies are: `rdata.h` → `endpoint.h`; `register.h` → `rdata.h` (transitively `endpoint.h`); `refer.h`, `session.h`, and `orig_host.h` are independent.
+
+**`cisco_orig_host` is a different shape** to the others: it's not a function library that other modules call, it's an `on_tx_request` `pjsip_module` that `res_pjsip_cisco_endpoint`'s `load_module` registers globally. Every outbound SIP request from any consumer module (or stock asterisk) passes through it; the hook rewrites the Request-URI and To-URI back to the phone's self-advertised host:port when `res_pjsip_nat`'s `rewrite_contact=yes` has left an `x-ast-orig-host` URI parameter on the Contact-derived RURI. Without this, Cisco firmware on NAT'd phones rejects unsolicited NOTIFYs/REFERs with `400 Bad Request` because the public NAT mapping in the RURI doesn't match what the phone knows about itself. A strict no-op for any URI lacking the parameter (LAN-registered contacts, upstream trunks, non-NAT'd targets) — consumers don't opt in, the hook just runs.
 
 ### Module loading & PIDF body-generator slot
 

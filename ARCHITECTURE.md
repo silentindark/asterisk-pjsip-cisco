@@ -480,3 +480,28 @@ Within CallBack, the phone's `usercalldata="Cancel"` sub-action would
 destroy the queued callback — a feature-level cancel that lives
 inside the CallBack handler. (The dispatch-level `softkeyevent="Cancel"`
 is a bare 202 in chan_sip too — no server-side action there.)
+
+### Investigated and skipped: `buggymwi` urgent-count suffix stripping
+
+Stock asterisk emits MWI bodies as `Voice-Message: NEW/OLD (URG_NEW/URG_OLD)`
+— the trailing `(0/0)` is the urgent-message-count tuple per RFC 3458.
+The chan_sip patch (line 1741) overrides `chan_sip.c`'s body builder so
+the suffix is omitted when the recipient endpoint is Cisco-flagged,
+inlining the old `buggymwi=yes` per-peer flag into the global
+`cisco_usecallmanager=yes` flag. Workaround for 79xx-era firmware
+that couldn't parse the trailing tuple and would fail to light the
+message-waiting indicator.
+
+Verified on 2026-05-14 against the live fleet (7975 / 9.4.2 and
+CP8861 / 14.1.1): both firmwares correctly parse the `(0/0)` and
+light the red MWI lamp. Workaround is not needed for any firmware
+this project currently encounters.
+
+If a future deployment ships with older firmware that *does* break:
+the port is a `body_supplement` registered for
+`application/simple-message-summary` (the MIME type asterisk uses for
+MWI NOTIFY bodies). The supplement strips trailing ` (0/0)` from any
+`Voice-Message:` line when the recipient endpoint has a parallel
+`type=cisco` sorcery section (same gating contract the rest of the
+project uses). ~30 lines, slots into `res_pjsip_cisco_pidf_body_generator.so`
+alongside the existing PIDF supplement. No redesign required.

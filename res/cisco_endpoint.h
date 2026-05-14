@@ -3,11 +3,15 @@
  *
  * Foundation header for the res_pjsip_cisco_* family of modules.
  *
- * Defines the 'cisco' sorcery type, the cisco_endpoint_get accessor,
+ * Declares the 'cisco' sorcery struct, the cisco_endpoint_get accessor,
  * and the astdb-backed feature-state accessors (DND, HuntGroup,
  * call-forward-all) that the dialplan, feature-event SUBSCRIBE handler,
  * bulkupdate, and PIDF body builders all share as their single source
- * of truth.
+ * of truth. Bodies live in res/cisco_endpoint.c, compiled into
+ * res_pjsip_cisco_endpoint.so; other cisco_* modules resolve the
+ * symbols at load time via the dynamic symbol table (the endpoint
+ * module is loaded with AST_MODFLAG_GLOBAL_SYMBOLS — same pattern stock
+ * res_pjsip uses to export ast_sip_*).
  *
  * URI / XML / rdata utilities live in cisco_rdata.h; REGISTER 200-OK
  * address-change tracking in cisco_register.h; OOB REFER + multipart
@@ -33,13 +37,9 @@
 
 #include "asterisk.h"
 
-#include "asterisk/astdb.h"
-#include "asterisk/presencestate.h"
 #include "asterisk/res_pjsip.h"
 #include "asterisk/sorcery.h"
 #include "asterisk/stringfields.h"
-#include "asterisk/strings.h"
-#include "asterisk/utils.h"
 
 struct cisco_endpoint {
 	SORCERY_OBJECT(details);
@@ -82,27 +82,13 @@ struct cisco_endpoint {
 };
 
 /*!
- * \brief Inline helper: retrieve cisco config for an endpoint by id.
+ * \brief Retrieve cisco config for an endpoint by id.
  * \retval ao2 ref-bumped cisco_endpoint, NULL if endpoint isn't
  *         configured as Cisco.
  *
  * Caller must ao2_cleanup() the returned object.
- *
- * Implemented inline so each consuming module gets its own copy and
- * we don't need to export a symbol from res_pjsip_cisco_endpoint.so
- * — Asterisk's per-module .exports linker scripts hide everything by
- * default, and exporting cross-module helpers reliably is a fight
- * with the build system. The struct definition above is the shared
- * contract; the sorcery type registration is the only thing
- * res_pjsip_cisco_endpoint.so uniquely owns.
  */
-static inline struct cisco_endpoint *cisco_endpoint_get(const char *id)
-{
-	if (ast_strlen_zero(id)) {
-		return NULL;
-	}
-	return ast_sorcery_retrieve_by_id(ast_sip_get_sorcery(), "cisco", id);
-}
+struct cisco_endpoint *cisco_endpoint_get(const char *id);
 
 /*!
  * \name astdb feature-state accessors
@@ -118,98 +104,18 @@ static inline struct cisco_endpoint *cisco_endpoint_get(const char *id)
  */
 /* @{ */
 
-static inline int cisco_dnd_is_enabled(const char *endpoint_id)
-{
-	char value[16];
+int cisco_dnd_is_enabled(const char *endpoint_id);
+void cisco_dnd_set(const char *endpoint_id, int enabled);
 
-	if (ast_strlen_zero(endpoint_id)) {
-		return 0;
-	}
-	if (ast_db_get("DND", endpoint_id, value, sizeof(value))) {
-		return 0;
-	}
-	return ast_true(value);
-}
-
-static inline void cisco_dnd_set(const char *endpoint_id, int enabled)
-{
-	/* No NULL guard: matches the original direct ast_db_put/del call
-	 * sites. A defensive ast_strlen_zero(endpoint_id) here gives GCC
-	 * grounds to infer that endpoint_id may be NULL at every caller,
-	 * which trips -Wformat-overflow on subsequent ast_log("%s", ...). */
-	if (enabled) {
-		ast_db_put("DND", endpoint_id, "YES");
-	} else {
-		ast_db_del("DND", endpoint_id);
-	}
-
-	/* Surface the change to BLF watchers. A hint of the form
-	 *   exten => N,hint,PJSIP/N,PJSIP:N
-	 * picks this up through the "PJSIP" presence-state provider
-	 * res_pjsip_cisco_endpoint registers (see that module), and
-	 * res_pjsip_exten_state then NOTIFYs the watching phones — whose
-	 * Cisco firmware renders <ce:dnd/> as a red lamp. Mirrors the
-	 * chan_sip cisco-usecallmanager patch, which fired
-	 * ast_presence_state_changed from sip_handle_publish_presence and
-	 * the `sip donotdisturb` CLI. DND off reports NOT_SET rather than
-	 * AVAILABLE so this provider only ever adds the DND signal and never
-	 * masks another presence source '&'-combined into the same hint. */
-	ast_presence_state_changed(enabled ? AST_PRESENCE_DND : AST_PRESENCE_NOT_SET,
-		NULL, NULL, "PJSIP:%s", endpoint_id);
-}
-
-static inline int cisco_huntgroup_is_in(const char *endpoint_id)
-{
-	char value[16];
-
-	if (ast_strlen_zero(endpoint_id)) {
-		return 0;
-	}
-	if (ast_db_get("HuntGroup", endpoint_id, value, sizeof(value))) {
-		return 0;
-	}
-	return ast_true(value);
-}
-
-static inline void cisco_huntgroup_set(const char *endpoint_id, int enabled)
-{
-	/* See cisco_dnd_set re: no NULL guard. */
-	if (enabled) {
-		ast_db_put("HuntGroup", endpoint_id, "YES");
-	} else {
-		ast_db_del("HuntGroup", endpoint_id);
-	}
-}
+int cisco_huntgroup_is_in(const char *endpoint_id);
+void cisco_huntgroup_set(const char *endpoint_id, int enabled);
 
 /*!
  * \brief Read the call-forward-all target into \a buf (empty when unset).
  * \return the (NUL-terminated) buf pointer, never NULL.
  */
-static inline const char *cisco_cfwd_get(const char *endpoint_id,
-	char *buf, size_t buflen)
-{
-	if (!buf || buflen == 0) {
-		return "";
-	}
-	buf[0] = '\0';
-	if (ast_strlen_zero(endpoint_id)) {
-		return buf;
-	}
-	if (ast_db_get("CF", endpoint_id, buf, buflen)) {
-		buf[0] = '\0';
-	}
-	return buf;
-}
-
-static inline void cisco_cfwd_set(const char *endpoint_id, const char *target)
-{
-	/* See cisco_dnd_set re: no NULL guard on endpoint_id. */
-	if (ast_strlen_zero(target)) {
-		ast_db_del("CF", endpoint_id);
-	} else {
-		ast_db_put("CF", endpoint_id, target);
-	}
-}
+const char *cisco_cfwd_get(const char *endpoint_id, char *buf, size_t buflen);
+void cisco_cfwd_set(const char *endpoint_id, const char *target);
 /* @} */
 
 #endif /* _RES_PJSIP_CISCO_ENDPOINT_H */

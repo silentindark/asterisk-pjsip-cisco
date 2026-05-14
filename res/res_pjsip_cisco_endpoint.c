@@ -188,8 +188,13 @@ static void *cisco_endpoint_alloc(const char *name)
 }
 
 /*
- * Note: cisco_endpoint_get() is implemented inline in cisco_endpoint.h,
- * not here. See that header for rationale.
+ * Note: cisco_endpoint_get() and the other shared cisco_* helpers are
+ * implemented in res/cisco_endpoint.c / cisco_rdata.c / cisco_register.c
+ * / cisco_refer.c / cisco_session.c — all compiled into this same .so.
+ * Sibling cisco_* modules pick the symbols up via the dynamic symbol
+ * table; this module is loaded with AST_MODFLAG_GLOBAL_SYMBOLS so its
+ * exports are visible to subsequent dlopens, exactly as stock res_pjsip
+ * exports ast_sip_* to every PJSIP submodule.
  */
 
 static int load_module(void)
@@ -270,7 +275,7 @@ static int unload_module(void)
 	return 0;
 }
 
-AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER,
+AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER | AST_MODFLAG_GLOBAL_SYMBOLS,
 	"PJSIP Cisco endpoint sorcery type",
 	.support_level = AST_MODULE_SUPPORT_EXTENDED,
 	.load = load_module,

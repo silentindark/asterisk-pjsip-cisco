@@ -101,7 +101,19 @@ MODULES := \
     res_pjsip_cisco_conference \
     res_pjsip_cisco_remotecc
 
-OBJS := $(addprefix res/,$(addsuffix .o,$(MODULES)))
+# Helper objects that live INSIDE res_pjsip_cisco_endpoint.so. Other
+# .so files link none of these — they call into the endpoint module's
+# exports at runtime via the dynamic symbol table (the endpoint module
+# is loaded with AST_MODFLAG_GLOBAL_SYMBOLS, matching the stock
+# res_pjsip pattern).
+ENDPOINT_HELPER_OBJS := \
+    res/cisco_endpoint.o \
+    res/cisco_rdata.o \
+    res/cisco_register.o \
+    res/cisco_refer.o \
+    res/cisco_session.o
+
+OBJS := $(addprefix res/,$(addsuffix .o,$(MODULES))) $(ENDPOINT_HELPER_OBJS)
 SOS  := $(addprefix res/,$(addsuffix .so,$(MODULES)))
 
 DOC_XML := doc/res_pjsip_cisco-en_US.xml
@@ -115,11 +127,27 @@ all: check-headers $(SOS) $(DOC_XML)
 # tag this module's logger lines; conventionally it matches the .so.
 # --------------------------------------------------------------------
 
-res/%.o: res/%.c res/cisco_endpoint.h
+# Every .o depends on every cisco_*.h — they're small headers and a
+# header change is rare enough that universal rebuild is the right
+# trade-off.
+res/%.o: res/%.c $(wildcard res/cisco_*.h)
 	$(CC) $(CFLAGS) -DAST_MODULE=\"$*\" -c $< -o $@
 
-res/%.so: res/%.o
-	$(CC) $(LDFLAGS) -o $@ $<
+# Endpoint module: link the entry point + all helper objects, enforce
+# the explicit symbol set via --version-script. cisco_* helpers are
+# exported globally so the other nine .so files can resolve them at
+# load time.
+res/res_pjsip_cisco_endpoint.so: \
+    res/res_pjsip_cisco_endpoint.o $(ENDPOINT_HELPER_OBJS) \
+    res/res_pjsip_cisco_endpoint.exports
+	$(CC) $(LDFLAGS) \
+	    -Wl,--version-script=res/res_pjsip_cisco_endpoint.exports \
+	    -o $@ \
+	    $(filter %.o,$^)
+
+# Every other .so: single .o + own .exports that hides everything.
+res/%.so: res/%.o res/%.exports
+	$(CC) $(LDFLAGS) -Wl,--version-script=res/$*.exports -o $@ $<
 
 # --------------------------------------------------------------------
 # XML documentation extraction.

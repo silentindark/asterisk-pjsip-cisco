@@ -288,17 +288,16 @@ ids; contact = the endpoint's registered contact URIs).
 
 ### res_pjsip_cisco_feature_events
 
-Handles Cisco phone-originated DND / CFwdALL softkey signaling, in both
-forms the firmware uses depending on the `<dndControl>` SEP setting:
-`Event: as-feature-event` SUBSCRIBE (`application/x-as-feature-event+xml`)
-and `Event: presence` PUBLISH (`application/pidf+xml` with a `<ce:dnd/>`
-activity). Both handlers run after PJSIP authentication and before stock
-pubsub, and write to the same astdb keys bulkupdate reads:
-`DND/<endpoint>` and `CF/<endpoint>`. The PUBLISH path also registers a
-`cisco_auth` endpoint identifier that matches the post-401 PUBLISH by its
-`Authorization` digest username, since Cisco's PUBLISH carries the device
-MAC (not the line id) in its From-URI and stock identifiers can't match
-it.
+Handles Cisco phone-originated DND softkey signaling. Cisco firmware
+on the live fleet (CP7975/9.4.2, CP8861/14.1.1) emits an `Event:
+presence` PUBLISH (`application/pidf+xml` carrying a `<ce:dnd/>`
+activity) on every DND on/off press. The handler runs after PJSIP
+authentication and before stock pubsub, and writes to the same
+`DND/<endpoint>` astdb key bulkupdate reads. Also registers a
+`cisco_auth` endpoint identifier that matches the post-401 PUBLISH by
+its `Authorization` digest username, since Cisco's PUBLISH carries
+the device MAC (not the line id) in its From-URI and stock
+identifiers can't match it.
 
 The same module closes a related gap for device-level REFER (RemoteCC
 token registration, alarm reports, RemoteCC responses) and some PUBLISH
@@ -480,6 +479,29 @@ Within CallBack, the phone's `usercalldata="Cancel"` sub-action would
 destroy the queued callback — a feature-level cancel that lives
 inside the CallBack handler. (The dispatch-level `softkeyevent="Cancel"`
 is a bare 202 in chan_sip too — no server-side action there.)
+
+### Removed: `as-feature-event` SUBSCRIBE handler (PATH A)
+
+The chan_sip patch (patch line 6413 in `channels/sip/handlers.c`)
+adds an `as-feature-event` SUBSCRIBE dispatcher that parses
+`application/x-as-feature-event+xml` bodies carrying
+`<SetDoNotDisturb>` / `<SetForwarding>` requests. The dispatcher is
+unconditional in chan_sip — not gated by `cisco_usecallmanager`.
+
+Originally ported into `res_pjsip_cisco_feature_events`. Removed
+2026-05-14 after determining it was unused on the live fleet:
+
+- Zero `as-feature-event` traffic observed in 7 days of journalctl.
+- DND on/off softkey presses observed arriving via `Event: presence`
+  PUBLISH (handled by PATH B).
+- CFwdAll softkey behaviour confirmed out-of-band by the deployment
+  owner as not depending on PATH A.
+
+If a future deployment ships with phones that *do* emit
+`as-feature-event` SUBSCRIBEs, the chan_sip patch is the wire-format
+reference. The earlier PJSIP port (visible in `git log` before the
+removal commit) is a starting point but only had DND wired through —
+the SetForwarding branch was present but never lived-tested.
 
 ### Investigated and skipped: `buggymwi` urgent-count suffix stripping
 

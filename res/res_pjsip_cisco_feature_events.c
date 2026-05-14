@@ -3,30 +3,13 @@
  *
  * res_pjsip_cisco_feature_events
  *
- * Closes the phone -> server side of the Cisco DND / call-forward
- * softkey loop, and resolves the MAC-address From-URI that Cisco
- * firmware uses on device-level REFER/PUBLISH. Handles both DND
- * signaling paths Cisco Enterprise SIP firmware uses, depending on the
- * phone's <dndControl> SEP setting:
+ * Closes the phone -> server side of the Cisco DND softkey loop and
+ * resolves the MAC-address From-URI that Cisco firmware uses on
+ * device-level REFER/PUBLISH. Two distinct signalling paths:
  *
- *   PATH A: SUBSCRIBE Event: as-feature-event (server-controlled DND,
- *   <dndControl>1</dndControl>). Body application/x-as-feature-event+xml:
- *
- *     <SetDoNotDisturb xmlns="...">
- *       <doNotDisturbOn>true|false</doNotDisturbOn>
- *     </SetDoNotDisturb>
- *
- *     <SetForwarding xmlns="...">
- *       <forwardingType>forwardImmediate</forwardingType>
- *       <activateForward>true|false</activateForward>
- *       <forwardDN>...</forwardDN>     <!-- target extension -->
- *     </SetForwarding>
- *
- *   We intercept via a pjsip_module on_rx_request hook at priority
- *   APPLICATION-1 (after res_pjsip's auth, before res_pjsip_pubsub).
- *
- *   PATH B: PUBLISH Event: presence (default DND mode on most modern
- *   firmware, <dndControl>0</dndControl>). Body application/pidf+xml:
+ *   PATH B: PUBLISH Event: presence — the form Cisco firmware on the
+ *   live fleet (CP7975 / CP8861) emits on every DND on/off press.
+ *   Body application/pidf+xml:
  *
  *     <presence ...>
  *       <dm:person><e:activities><ce:dnd/></e:activities></dm:person>
@@ -61,14 +44,11 @@
  *   <ce:dnd/> vs empty activities, writes DND/<endpoint-id> to
  *   astdb, and replies 200 OK with SIP-ETag + Expires.
  *
- * Both paths write to the same astdb keys:
+ * Writes to astdb in the same convention as res_pjsip_cisco_bulkupdate:
  *   DND/<endpoint-id>  = "YES" / (deleted)
- *   CF/<endpoint-id>   = <target> / (deleted)
  *
- * Same convention as res_pjsip_cisco_bulkupdate, so a server-side
- * toggle (database put DND 1010 YES) and a phone-side softkey press
- * now write to the same store regardless of which signaling path the
- * firmware uses.
+ * So a server-side toggle (database put DND 1010 YES) and a
+ * phone-side softkey press land in the same store.
  *
  *   PATH C: MAC-address From-URI identification. Cisco firmware puts
  *   the device MAC (not the line id) in the From-URI user of
@@ -99,19 +79,17 @@
  *   - Automatic server -> phone push when astdb changes out of band.
  *     The CISCO_* dialplan functions and matching `pjsip cisco ...`
  *     CLI verbs already push a bulkupdate REFER from
- *     res_pjsip_cisco_bulkupdate; direct DB()/AMI/database writes still
- *     require an explicit `pjsip cisco bulkupdate` because there is no
- *     astdb change notification. A feature-events NOTIFY path would
- *     require holding the SUBSCRIBE dialog open; the chan_sip patch's
- *     peer->feature_events_dialog branch is the reference.
- *   - PATH B call-forward (the SetForwarding equivalent in PUBLISH).
- *     Cisco firmware appears to use as-feature-event for CFwdALL
- *     even when DND is on PUBLISH, so PATH A handles CF in practice;
- *     revisit if we see a fleet that puts CF on PUBLISH too.
+ *     res_pjsip_cisco_bulkupdate; direct DB()/AMI/database writes
+ *     still require an explicit `pjsip cisco bulkupdate` because
+ *     there is no astdb change notification.
+ *   - Call-forward signalling from the phone-side softkey. The
+ *     chan_sip patch handled CFwdALL via an `as-feature-event`
+ *     SUBSCRIBE with a SetForwarding body; we never observed that
+ *     traffic on the live fleet (see the "Removed: as-feature-event
+ *     SUBSCRIBE handler" entry in ARCHITECTURE.md). CF state is
+ *     currently only writable via `pjsip cisco cfwd ...` or DB() from
+ *     the dialplan.
  *
- * Spec for PATH A: chan_sip patch's
- * channels/sip/handlers.c:1444+ (SUBSCRIBE dispatch) and
- * channels/sip/handlers.c:2315+ (sip_handle_subscribe_feature_event).
  * Spec for PATH B: chan_sip patch's
  * channels/sip/handlers.c:13370+ sip_handle_publish_presence and the
  * auth-bypass at chan_sip.c:10053 (which we deliberately do NOT
@@ -144,159 +122,7 @@
 #include "cisco_endpoint.h"
 #include "cisco_rdata.h"
 
-#define FEATURE_EVENT_MAX_BODY 8192
 #define DND_PUBLISH_MAX_BODY 4096
-
-/*!
- * \brief Parse the SUBSCRIBE body, update astdb if it's a recognised
- *        feature-event request.
- *
- * \retval 1 we handled it (caller should send 200 OK + return PJ_TRUE)
- * \retval 0 not for us (caller should ignore, return PJ_FALSE)
- */
-static int handle_feature_event_body(pjsip_rx_data *rdata, const char *endpoint_id)
-{
-	pjsip_msg_body *body = rdata->msg_info.msg->body;
-	pjsip_ctype_hdr *ctype;
-	struct ast_xml_doc *doc;
-	struct ast_xml_node *root;
-	const char *root_name;
-
-	if (!body || !body->data || body->len == 0) {
-		/* Empty SUBSCRIBE = "tell me current state" (bulk-update
-		 * request). We don't push state back at the moment; just
-		 * accept the subscription quietly. */
-		return 1;
-	}
-
-	ctype = (pjsip_ctype_hdr *) pjsip_msg_find_hdr(rdata->msg_info.msg,
-		PJSIP_H_CONTENT_TYPE, NULL);
-	if (!ctype
-		|| pj_stricmp2(&ctype->media.type, "application")
-		|| pj_stricmp2(&ctype->media.subtype, "x-as-feature-event+xml")) {
-		ast_debug(2, "cisco-feature-events: unknown Content-Type, skipping\n");
-		return 0;
-	}
-
-	if (body->len > FEATURE_EVENT_MAX_BODY) {
-		ast_log(LOG_WARNING,
-			"cisco-feature-events: rejecting oversized feature-event body (%u bytes)\n",
-			(unsigned) body->len);
-		return 1;
-	}
-
-	doc = cisco_xml_read_body(body);
-	if (!doc) {
-		ast_debug(2, "cisco-feature-events: XML parse failed\n");
-		return 0;
-	}
-
-	root = ast_xml_get_root(doc);
-	if (!root) {
-		ast_xml_close(doc);
-		return 0;
-	}
-	root_name = ast_xml_node_get_name(root);
-
-	if (!strcmp(root_name, "SetDoNotDisturb")) {
-		struct ast_xml_node *child;
-		const char *value;
-
-		child = ast_xml_find_element(ast_xml_node_get_children(root), "doNotDisturbOn", NULL, NULL);
-		value = child ? ast_xml_get_text(child) : NULL;
-		if (value) {
-			if (!strcmp(value, "true")) {
-				cisco_dnd_set(endpoint_id, 1);
-				ast_log(LOG_NOTICE,
-					"cisco-feature-events: %s set DND on (from softkey)\n",
-					endpoint_id);
-			} else if (!strcmp(value, "false")) {
-				cisco_dnd_set(endpoint_id, 0);
-				ast_log(LOG_NOTICE,
-					"cisco-feature-events: %s set DND off (from softkey)\n",
-					endpoint_id);
-			}
-			ast_xml_free_text(value);
-		}
-	} else if (!strcmp(root_name, "SetForwarding")) {
-		struct ast_xml_node *act_node, *dn_node;
-		const char *activate;
-		const char *target;
-
-		act_node = ast_xml_find_element(ast_xml_node_get_children(root), "activateForward", NULL, NULL);
-		activate = act_node ? ast_xml_get_text(act_node) : NULL;
-		if (activate && !strcmp(activate, "true")) {
-			dn_node = ast_xml_find_element(ast_xml_node_get_children(root), "forwardDN", NULL, NULL);
-			target = dn_node ? ast_xml_get_text(dn_node) : NULL;
-			if (!ast_strlen_zero(target)) {
-				cisco_cfwd_set(endpoint_id, target);
-				ast_log(LOG_NOTICE,
-					"cisco-feature-events: %s set call-forward to %s "
-					"(from softkey)\n", endpoint_id, target);
-			}
-			if (target) {
-				ast_xml_free_text(target);
-			}
-		} else {
-			cisco_cfwd_set(endpoint_id, NULL);
-			ast_log(LOG_NOTICE,
-				"cisco-feature-events: %s cleared call-forward (from softkey)\n",
-				endpoint_id);
-		}
-		if (activate) {
-			ast_xml_free_text(activate);
-		}
-	} else {
-		ast_debug(2, "cisco-feature-events: unrecognised root element <%s>\n",
-			root_name);
-		ast_xml_close(doc);
-		return 0;
-	}
-
-	ast_xml_close(doc);
-	return 1;
-}
-
-/*!
- * \brief Send a minimal 200 OK to a SUBSCRIBE we've handled.
- *
- * No body, Subscription-State: terminated;reason=noresource so the
- * phone doesn't expect us to push NOTIFYs into the dialog. The
- * softkey-driven SUBSCRIBE is one-shot from the firmware's POV.
- */
-static void send_subscribe_response(pjsip_rx_data *rdata,
-	struct ast_sip_endpoint *endpoint)
-{
-	pjsip_tx_data *tdata;
-
-	if (ast_sip_create_response(rdata, 200, NULL, &tdata)) {
-		return;
-	}
-
-	ast_sip_add_header(tdata, "Subscription-State", "terminated;reason=noresource");
-
-	ast_sip_send_stateful_response(rdata, tdata, endpoint);
-}
-
-static pj_bool_t feature_events_on_rx_request(pjsip_rx_data *rdata)
-{
-	struct ast_sip_endpoint *endpoint;
-	int handled;
-
-	endpoint = cisco_pjsip_module_match(rdata, "SUBSCRIBE", "as-feature-event");
-	if (!endpoint) {
-		return PJ_FALSE;
-	}
-
-	handled = handle_feature_event_body(rdata,
-		ast_sorcery_object_get_id(endpoint));
-	if (handled) {
-		send_subscribe_response(rdata, endpoint);
-	}
-
-	ao2_cleanup(endpoint);
-	return handled ? PJ_TRUE : PJ_FALSE;
-}
 
 /* ----------------------------------------------------------------------
  * PATH B: PUBLISH presence handler with Authorization-username
@@ -812,9 +638,6 @@ static pj_bool_t cisco_mac_harvest_on_rx_request(pjsip_rx_data *rdata)
  * never sees it) isn't pointlessly clamped. */
 static pj_bool_t cisco_feature_events_on_rx_request(pjsip_rx_data *rdata)
 {
-	if (feature_events_on_rx_request(rdata)) {
-		return PJ_TRUE;
-	}
 	if (publish_dnd_on_rx_request(rdata)) {
 		return PJ_TRUE;
 	}

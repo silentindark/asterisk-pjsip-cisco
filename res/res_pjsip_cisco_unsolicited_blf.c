@@ -63,6 +63,112 @@
 
 static struct ast_taskprocessor *unsolicited_serializer;
 static struct ao2_container *unsolicited_addr_cache;
+static pjsip_module unsolicited_tx_module;	/* defined further down */
+
+/* mod_data dictionary key — Asterisk forwards the key to pj_hash_set
+ * with PJ_HASH_KEY_STRING, so it must be a non-NULL C string. */
+#define MOD_DATA_UNSOLICITED_TX	"unsolicited_tx"
+
+/*
+ * Per-NOTIFY payload, kept alive across the whole transaction.
+ *
+ * The hook reads (exten, exten_state, presence_state) via mod_data to
+ * rebuild the PIDF body with the post-transport-selection From host;
+ * see unsolicited_tx_request for why that work has to happen at tx
+ * time, not at create time.
+ *
+ * The response callback reads (endpoint_id, exten, contact_uri) to
+ * log non-2xx / timeout / transport-error outcomes. Without this log
+ * a NOTIFY rejection (e.g. Cisco 88xx answering 400) is invisible —
+ * only a tcpdump capture would reveal it.
+ *
+ * Ownership: the only ao2 ref is the one ast_sip_send_request gets
+ * via its 'token' argument. PJSIP's internal send_request_cb wrapper
+ * fires the user callback exactly once on transaction termination
+ * (PJSIP_EVENT_TIMER / PJSIP_EVENT_TRANSPORT_ERROR / PJSIP_EVENT_RX_MSG
+ * — see res_pjsip.c:1882-1928), which is where the payload is
+ * released. The mod_data slot is a raw borrow the hook reads but
+ * does not refcount.
+ *
+ * Why not have the hook own the ref: PJSIP only fires on_tx_request
+ * synchronously when the transport is already resolved AND the send
+ * doesn't return PJ_EPENDING. For an outbound NOTIFY to a TCP/TLS
+ * contact whose connect hasn't completed, or any destination needing
+ * DNS resolution, ast_sip_send_request returns success and the hook
+ * fires later from the resolver/transport completion callback (see
+ * pjproject's sip_transaction.c:2510 + 2579). If the caller released
+ * the ref right after send_request, the hook would dereference freed
+ * memory. Tying the lifetime to the transaction's terminal callback
+ * covers both sync and async paths uniformly.
+ *
+ * The one case the response callback can't cover is synchronous
+ * failure of ast_sip_send_request itself (it consumes tdata and
+ * returns -1 before any transaction is created, so the user callback
+ * never fires) — send_unsolicited_notify manually dec_refs on that
+ * path. Same convention every stock caller follows; see
+ * res_pjsip_messaging.c:771-776 for the canonical pattern.
+ */
+struct unsolicited_notify_payload {
+	char *endpoint_id;
+	char *contact_uri;
+	char *exten;
+	int exten_state;
+	int presence_state;
+};
+
+static void unsolicited_notify_payload_destroy(void *obj)
+{
+	struct unsolicited_notify_payload *p = obj;
+
+	ast_free(p->endpoint_id);
+	ast_free(p->contact_uri);
+	ast_free(p->exten);
+}
+
+static void unsolicited_response_cb(void *token, pjsip_event *e)
+{
+	struct unsolicited_notify_payload *p = token;
+	int status_code;
+
+	if (e->body.tsx_state.type == PJSIP_EVENT_TIMER) {
+		ast_log(LOG_NOTICE,
+			"cisco-unsolicited-blf: NOTIFY for '%s' timed out — "
+			"endpoint='%s' contact='%s' (BLF buttons watching this "
+			"extension on this contact will not light)\n",
+			p->exten, p->endpoint_id, p->contact_uri);
+		ao2_ref(p, -1);
+		return;
+	}
+	if (e->body.tsx_state.type == PJSIP_EVENT_TRANSPORT_ERROR) {
+		ast_log(LOG_NOTICE,
+			"cisco-unsolicited-blf: NOTIFY for '%s' failed (transport error) — "
+			"endpoint='%s' contact='%s' (BLF buttons watching this "
+			"extension on this contact will not light)\n",
+			p->exten, p->endpoint_id, p->contact_uri);
+		ao2_ref(p, -1);
+		return;
+	}
+	if (e->body.tsx_state.type != PJSIP_EVENT_RX_MSG
+		|| !e->body.tsx_state.tsx) {
+		ao2_ref(p, -1);
+		return;
+	}
+
+	status_code = e->body.tsx_state.tsx->status_code;
+	if (status_code >= 300) {
+		ast_log(LOG_NOTICE,
+			"cisco-unsolicited-blf: NOTIFY for '%s' rejected with %d — "
+			"endpoint='%s' contact='%s' (BLF buttons watching this "
+			"extension on this contact will not light)\n",
+			p->exten, status_code, p->endpoint_id, p->contact_uri);
+	} else {
+		ast_debug(2,
+			"cisco-unsolicited-blf: NOTIFY for '%s' accepted (%d) — "
+			"endpoint='%s' contact='%s'\n",
+			p->exten, status_code, p->endpoint_id, p->contact_uri);
+	}
+	ao2_ref(p, -1);
+}
 
 /*
  * Build the Cisco-flavoured PIDF body for a given extension state.
@@ -130,6 +236,107 @@ static char *build_cisco_pidf(const char *exten, const char *domain,
 	ast_free(out);
 	return result;
 }
+
+/*
+ * tx_request hook: rewrite the NOTIFY's From URI to a destination-
+ * relative local address (mirrors what res_pjsip_nat does for Contact
+ * and Via — but for From), then rebuild the PIDF body so its entity=
+ * URI matches. Without this, PJSIP leaves the LAN bind address in the
+ * From URI for outbound NOTIFYs to NAT'd contacts, and strict UAs
+ * (Cisco 88xx series) reject with 400 Bad Request because the From
+ * domain is unreachable from their side. The chan_sip
+ * cisco-usecallmanager patch achieved the same per-destination
+ * rewrite naturally via ast_sip_ouraddrfor() at NOTIFY-construction
+ * time (see patch line 2468 in extensionstate_subscriptions plus the
+ * From-domain assignment at line 1097).
+ *
+ * Done at tx time, not create time, because ast_sip_rewrite_uri_to_local
+ * → ast_sip_set_request_transport_details dereferences
+ * tdata->tp_info.transport, which is only populated after PJSIP picks
+ * a transport — i.e. during the send chain, not at create_request.
+ *
+ * Filter to "our" NOTIFYs by checking ast_sip_mod_data_get for the
+ * payload send_unsolicited_notify stashed; everyone else's traffic
+ * passes through untouched.
+ */
+static pj_status_t unsolicited_tx_request(pjsip_tx_data *tdata)
+{
+	struct unsolicited_notify_payload *d;
+	pjsip_sip_uri *from_uri;
+	char domain_buf[PJSIP_MAX_URL_SIZE];
+	char *xml;
+	pj_str_t type;
+	pj_str_t subtype;
+	pj_str_t text;
+
+	d = ast_sip_mod_data_get(tdata->mod_data, unsolicited_tx_module.id,
+		MOD_DATA_UNSOLICITED_TX);
+	if (!d) {
+		return PJ_SUCCESS;
+	}
+	/* One-shot: clear the slot so retransmits (auth retry, PJSIP-level
+	 * retries) don't rebuild the body a second time. Payload lifetime
+	 * is held by the response-callback token, not by this slot, so
+	 * clearing does not affect refcounting. */
+	ast_sip_mod_data_set(tdata->pool, tdata->mod_data,
+		unsolicited_tx_module.id, MOD_DATA_UNSOLICITED_TX, NULL);
+
+	from_uri = cisco_tdata_from_sip_uri(tdata);
+	if (!from_uri) {
+		return PJ_SUCCESS;
+	}
+	/* Core helper: copies the dialog/Contact-derived host into the URI,
+	 * then (when the destination is non-local on the selected
+	 * transport) replaces it with that transport's
+	 * external_signaling_address — same path res_pjsip_nat uses for
+	 * Contact and Via. Returns 0 in both the rewritten and
+	 * not-rewritten cases; we just trust the result. */
+	ast_sip_rewrite_uri_to_local(from_uri, tdata);
+
+	/* Rebuild the PIDF body with the (possibly-rewritten) From URI's
+	 * host as the entity= domain — chan_sip put the same per-
+	 * destination ourip in both From and PIDF (line 1097 of the
+	 * patch); 88xx firmware appears to validate at least one of them. */
+	if (cisco_copy_sip_uri_hostport(from_uri, domain_buf,
+			sizeof(domain_buf))) {
+		return PJ_SUCCESS;
+	}
+	xml = build_cisco_pidf(d->exten, domain_buf, d->exten_state,
+		d->presence_state);
+	if (!xml) {
+		return PJ_SUCCESS;
+	}
+	pj_strset2(&type, "application");
+	pj_strset2(&subtype, "pidf+xml");
+	pj_strdup2(tdata->pool, &text, xml);
+	{
+		pjsip_msg_body *new_body = pjsip_msg_body_create(tdata->pool,
+			&type, &subtype, &text);
+
+		ast_free(xml);
+		if (new_body) {
+			/* Replace only on success; on failure leave the original
+			 * body in place so the NOTIFY at least still has the
+			 * pre-rewrite PIDF (broken on NAT but no worse than
+			 * before this hook existed). */
+			tdata->msg->body = new_body;
+			/* PJSIP recomputes Content-Length on serialise. */
+		}
+	}
+
+	return PJ_SUCCESS;
+}
+
+static pjsip_module unsolicited_tx_module = {
+	.name           = { "cisco-unsolicited-blf-tx", 24 },
+	.id             = -1,
+	/* Application priority — pure header rewrite, no transaction
+	 * state inspection. Order vs. res_pjsip_nat doesn't matter:
+	 * ast_sip_rewrite_uri_to_local does its own transport lookup
+	 * rather than relying on Contact already being rewritten. */
+	.priority       = PJSIP_MOD_PRIORITY_APPLICATION,
+	.on_tx_request  = unsolicited_tx_request,
+};
 
 /*
  * Send a single unsolicited Event: presence NOTIFY to the phone for
@@ -214,6 +421,20 @@ static int send_unsolicited_notify(struct ast_sip_endpoint *endpoint,
 	 * Force From header to be the watched extension's URI, not the
 	 * endpoint's own URI. Cisco firmware uses the From URI to bind
 	 * the NOTIFY to the line button's monitored extension.
+	 *
+	 * The From URI's host stays as whatever PJSIP picked at create
+	 * time (endpoint bind / fromdomain). For non-local contacts that
+	 * leaves a LAN address in the From — strict UAs (Cisco 88xx)
+	 * reject the resulting NOTIFY with 400 Bad Request because the
+	 * From domain is unreachable from their side. Fixed at tx time
+	 * by the on_tx_request hook below: it calls
+	 * ast_sip_rewrite_uri_to_local() which uses PJSIP's actual
+	 * post-transport-selection address picker (the same code path
+	 * res_pjsip_nat uses for Contact/Via). chan_sip's
+	 * per-destination ast_sip_ouraddrfor() achieved the same thing
+	 * automatically — see cisco-usecallmanager-20.19.0.patch line
+	 * 2468 in extensionstate_subscriptions + the From-domain
+	 * assignment at line 1097.
 	 */
 	{
 		pjsip_fromto_hdr *from;
@@ -267,10 +488,50 @@ static int send_unsolicited_notify(struct ast_sip_endpoint *endpoint,
 		return -1;
 	}
 
-	if (ast_sip_send_request(tdata, NULL, endpoint, NULL, NULL)) {
-		ast_log(LOG_WARNING,
-			"cisco-unsolicited-blf: send_request failed for %s\n", exten);
-		return -1;
+	/* Allocate the per-NOTIFY payload that lives across the whole
+	 * transaction. The response callback owns the only ao2 ref (via
+	 * the token argument to ast_sip_send_request) and releases it
+	 * when the transaction terminates — see the struct comment for
+	 * full lifetime rationale. The mod_data slot is a raw borrow the
+	 * hook reads but does not refcount. */
+	{
+		struct unsolicited_notify_payload *payload;
+
+		payload = ao2_alloc(sizeof(*payload),
+			unsolicited_notify_payload_destroy);
+		if (!payload) {
+			pjsip_tx_data_dec_ref(tdata);
+			return -1;
+		}
+		payload->endpoint_id = ast_strdup(
+			ast_sorcery_object_get_id(endpoint));
+		payload->contact_uri = ast_strdup(contact->uri);
+		payload->exten = ast_strdup(exten);
+		payload->exten_state = exten_state;
+		payload->presence_state = presence_state;
+		if (!payload->endpoint_id || !payload->contact_uri
+			|| !payload->exten) {
+			ao2_ref(payload, -1);
+			pjsip_tx_data_dec_ref(tdata);
+			return -1;
+		}
+		ast_sip_mod_data_set(tdata->pool, tdata->mod_data,
+			unsolicited_tx_module.id, MOD_DATA_UNSOLICITED_TX,
+			payload);
+
+		if (ast_sip_send_request(tdata, NULL, endpoint, payload,
+				unsolicited_response_cb)) {
+			ast_log(LOG_WARNING,
+				"cisco-unsolicited-blf: send_request failed for %s\n",
+				exten);
+			/* No transaction created → response callback won't
+			 * fire → token never released by anything but us.
+			 * tdata's ref is already consumed by send_request
+			 * (matches stock callers — res_pjsip_messaging.c:771,
+			 * res_pjsip_notify.c:781). */
+			ao2_ref(payload, -1);
+			return -1;
+		}
 	}
 
 	ast_debug(2,
@@ -654,6 +915,18 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	if (ast_sip_register_service(&unsolicited_tx_module)) {
+		ao2_cleanup(unsolicited_addr_cache);
+		unsolicited_addr_cache = NULL;
+		ao2_cleanup(ext_state_watchers);
+		ext_state_watchers = NULL;
+		ast_taskprocessor_unreference(unsolicited_serializer);
+		unsolicited_serializer = NULL;
+		ast_log(LOG_ERROR,
+			"cisco-unsolicited-blf: failed to register tx pjsip module\n");
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
 	ast_sip_register_supplement(&unsolicited_supplement);
 	return AST_MODULE_LOAD_SUCCESS;
 }
@@ -667,6 +940,7 @@ static int unload_module(void)
 		return -1;
 	}
 	ast_sip_unregister_supplement(&unsolicited_supplement);
+	ast_sip_unregister_service(&unsolicited_tx_module);
 	ao2_cleanup(unsolicited_addr_cache);
 	unsolicited_addr_cache = NULL;
 	ao2_cleanup(ext_state_watchers);

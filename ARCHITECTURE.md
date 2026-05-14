@@ -423,8 +423,16 @@ and softhangs the selected calls' phone-side anchors. Cleanup is a
 single OOB REFER with `<notifyreq><feature>Join</feature>
 <status>Complete</status>` targeting the active dialog.
 
-`RmLastConf` (remove the most recently joined party from a conference)
-is the named remaining gap — still deferred.
+**RmLastConf** — remove the most-recently-joined participant. Track
+join order via a per-channel timestamp datastore attached at every
+remote-leg `ast_bridge_move` (helpers `cisco_conf_mark_joined()` /
+`cisco_conf_find_last_joined()` in `cisco_session.c`). The handler
+resolves the REFER's `<dialogid>` to the phone's session → channel →
+bridge, picks the tracked channel with the latest timestamp
+(excluding the phone's own anchor, which isn't marked), and
+`ast_bridge_remove()`s it. No-op with a NOTICE log when the bridge
+has no tracked participants (a 2-party call, a stock ConfBridge we
+didn't build, or all conference participants have already left).
 
 ## Build system
 
@@ -463,15 +471,10 @@ line-mapped back to a function in
 Known remaining feature gaps (RemoteCC softkeys whose Asterisk-side
 integration hasn't been ported):
 
-- **`RmLastConf`** — remove the most recently joined party from a
-  conference. The rest of the conference family (Confrn, ConfList +
-  action softkeys, Select / Unselect / Join) is implemented; this is
-  the named remaining piece. Currently falls through to
-  `res_pjsip_cisco_remotecc`'s `603 Decline`.
 - **`Cancel` server-side cancellation** — the softkey is accepted
   (200 OK to the REFER) but the implied "cancel my in-progress
   operation on the server" hasn't been wired through. Tracked by the
   TODO at `handle_softkey_event` in `res_pjsip_cisco_remotecc.c`.
 
-Each is additive — same supplement / register-service / pubsub
-pattern as the existing modules; no redesign required when picked up.
+Additive when picked up — same supplement / register-service /
+pubsub pattern as the existing modules; no redesign required.

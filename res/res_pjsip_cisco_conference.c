@@ -32,7 +32,14 @@
  *     conference, softhanging the selected calls' phone-side anchors.
  *     Cleanup is a single OOB REFER with a <notifyreq><feature>Join
  *     </feature><status>Complete</status> body targeting the active
- *     dialog. RmLastConf is still deferred.
+ *     dialog.
+ *   - RmLastConf: remove the most-recently-joined participant from
+ *     the conference. Tracks join order via per-channel datastores
+ *     attached by cisco_conf_mark_joined() (cisco_session.c) at every
+ *     remote-leg ast_bridge_move; the handler finds the channel with
+ *     the latest timestamp and ast_bridge_remove()s it. Phone-side
+ *     anchors aren't marked, so RmLastConf can't remove the user who
+ *     pressed it.
  *
  * Architecture:
  *   - Registers a pjsip_module at PJSIP_MOD_PRIORITY_APPLICATION - 2,
@@ -548,6 +555,7 @@ enum remotecc_softkey_kind {
 	REMOTECC_SOFTKEY_SELECT,          /* <softkeyeventmsg>Select */
 	REMOTECC_SOFTKEY_UNSELECT,        /* <softkeyeventmsg>Unselect */
 	REMOTECC_SOFTKEY_JOIN,            /* <softkeyeventmsg>Join */
+	REMOTECC_SOFTKEY_RMLASTCONF,      /* <softkeyeventmsg>RmLastConf */
 	/* A datapassthroughreq REFER carrying applicationid=1 and (in the
 	 * second multipart part) free-form user_call_data — chan_sip patch's
 	 * ConfList Mute/Remove/Update/<participant> two-step protocol. */
@@ -645,6 +653,8 @@ static int detect_remotecc_softkey(pjsip_msg_body *body,
 		out->kind = REMOTECC_SOFTKEY_UNSELECT;
 	} else if (!strcmp(softkey, "Join")) {
 		out->kind = REMOTECC_SOFTKEY_JOIN;
+	} else if (!strcmp(softkey, "RmLastConf")) {
+		out->kind = REMOTECC_SOFTKEY_RMLASTCONF;
 	} else {
 		/* Not ours — let remotecc.c handle (HLog/MCID/Park/…). */
 		goto done;
@@ -2194,6 +2204,128 @@ static void queue_conference(struct ast_sip_endpoint *endpoint,
 	}
 }
 
+/* ---- RmLastConf: remove the most-recently-joined participant ----
+ *
+ * chan_sip patch (channels/sip/conference.c handle_remotecc_rmlastconf,
+ * patch line 4331): resolve the REFER's <dialogid> to the call-leg pvt,
+ * check if it's part of a conference, then ast_bridge_remove() the
+ * first entry in conference->participants. The list is LIFO-inserted
+ * so AST_LIST_FIRST is the most recent join.
+ *
+ * Our equivalent uses the per-channel join-time datastore (see
+ * cisco_conf_mark_joined() in cisco_session.c, attached after every
+ * remote-leg ast_bridge_move in Confrn and Join). The task body
+ * walks the phone-side dialog → channel → bridge, then picks the
+ * other-channel-with-max-timestamp via cisco_conf_find_last_joined().
+ */
+struct rmlastconf_task_data {
+	struct ast_sip_endpoint *endpoint;
+	struct ast_sip_contact *contact;
+	struct conference_dialog_id active_dialog;
+};
+
+static void rmlastconf_task_data_destroy(void *obj)
+{
+	struct rmlastconf_task_data *data = obj;
+
+	ao2_cleanup(data->endpoint);
+	ao2_cleanup(data->contact);
+}
+
+static int rmlastconf_send_task(void *obj)
+{
+	RAII_VAR(struct rmlastconf_task_data *, data, obj, ao2_cleanup);
+	struct ast_sip_session *session;
+	struct ast_channel *chan_phone = NULL;
+	struct ast_bridge *bridge = NULL;
+	struct ast_channel *victim = NULL;
+	const char *endpoint_id;
+
+	endpoint_id = ast_sorcery_object_get_id(data->endpoint);
+
+	session = cisco_dialog_session_lookup(data->active_dialog.call_id,
+		data->active_dialog.local_tag, data->active_dialog.remote_tag);
+	if (!session) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s RmLastConf — dialog %s no longer "
+			"exists; nothing to remove\n",
+			endpoint_id, data->active_dialog.call_id);
+		return 0;
+	}
+	chan_phone = cisco_session_channel_ref(session);
+	ao2_cleanup(session);
+	if (!chan_phone) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s RmLastConf — dialog %s has no "
+			"channel\n", endpoint_id, data->active_dialog.call_id);
+		return 0;
+	}
+
+	ast_channel_lock(chan_phone);
+	bridge = ast_channel_get_bridge(chan_phone);
+	ast_channel_unlock(chan_phone);
+	if (!bridge) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s RmLastConf — channel %s is not in "
+			"a bridge (no active conference to operate on)\n",
+			endpoint_id, ast_channel_name(chan_phone));
+		ast_channel_unref(chan_phone);
+		return 0;
+	}
+
+	victim = cisco_conf_find_last_joined(bridge, chan_phone);
+	if (!victim) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s RmLastConf — no tracked participant "
+			"in the bridge to remove (a 2-party call, a stock "
+			"ConfBridge we didn't build, or every conference participant "
+			"has already left)\n", endpoint_id);
+		ao2_ref(bridge, -1);
+		ast_channel_unref(chan_phone);
+		return 0;
+	}
+
+	ast_log(LOG_NOTICE,
+		"cisco-conference: %s RmLastConf — removing most-recently-"
+		"joined participant %s from conference bridge\n",
+		endpoint_id, ast_channel_name(victim));
+	if (ast_bridge_remove(bridge, victim)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s RmLastConf — ast_bridge_remove(%s) "
+			"failed; the participant may have already left\n",
+			endpoint_id, ast_channel_name(victim));
+	}
+
+	ast_channel_unref(victim);
+	ao2_ref(bridge, -1);
+	ast_channel_unref(chan_phone);
+	return 0;
+}
+
+static void queue_rmlastconf(struct ast_sip_endpoint *endpoint,
+	struct ast_sip_contact *contact,
+	const struct conference_dialog_id *active_dialog)
+{
+	struct rmlastconf_task_data *data;
+
+	data = ao2_alloc(sizeof(*data), rmlastconf_task_data_destroy);
+	if (!data) {
+		return;
+	}
+	ao2_ref(endpoint, +1);
+	data->endpoint = endpoint;
+	ao2_ref(contact, +1);
+	data->contact = contact;
+	data->active_dialog = *active_dialog;
+
+	if (ast_sip_push_task(conference_serializer, rmlastconf_send_task,
+			data)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: failed to queue RmLastConf task\n");
+		ao2_cleanup(data);
+	}
+}
+
 static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 {
 	struct ast_sip_endpoint *endpoint;
@@ -2340,6 +2472,14 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 			msg.dialog_id.call_id);
 		cisco_send_refer_response(rdata, 202, endpoint);
 		queue_join(endpoint, contact, &msg.dialog_id, keep_conference);
+		break;
+	case REMOTECC_SOFTKEY_RMLASTCONF:
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s pressed RmLastConf from %s "
+			"(callid=%s)\n", endpoint_id, contact->uri,
+			msg.dialog_id.call_id);
+		cisco_send_refer_response(rdata, 202, endpoint);
+		queue_rmlastconf(endpoint, contact, &msg.dialog_id);
 		break;
 	default:
 		/* Compiler completeness — kind == NONE already returned above. */

@@ -25,8 +25,14 @@
  *     including holdretrieve REFER + Cisco-flavoured completion NOTIFY,
  *     connected-line "Conference" display token, explicit consult-anchor
  *     softhangup, and the cisco_keep_conference initiator-hangup knob.
- *   - Join (multi-call merge via Select/Unselect) and RmLastConf are
- *     still deferred.
+ *   - Select / Unselect / Join: the multi-call merge path. Select adds a
+ *     dialog to the cisco_selected_calls list; Unselect removes it; Join
+ *     (pressed on the active call) merges the active call's phone-side
+ *     plus each selected call's remote-side into a single multimix
+ *     conference, softhanging the selected calls' phone-side anchors.
+ *     Cleanup is a single OOB REFER with a <notifyreq><feature>Join
+ *     </feature><status>Complete</status> body targeting the active
+ *     dialog. RmLastConf is still deferred.
  *
  * Architecture:
  *   - Registers a pjsip_module at PJSIP_MOD_PRIORITY_APPLICATION - 2,
@@ -301,6 +307,158 @@ static int conflist_pending_lookup(const char *endpoint_id,
 	return found_dialog;
 }
 
+/*!
+ * \brief Per-endpoint per-dialog "I want to merge this call" marker,
+ *        set by the Select softkey and consumed by the next Join press.
+ *
+ * Mirrors chan_sip's dialog->peer->selected list. ao2_container keyed by
+ * the combination of endpoint_id and dialog_id (call_id + both tags),
+ * so an endpoint can have multiple selected dialogs simultaneously.
+ * Unselect drops a single entry; a successful Join clears all entries
+ * for the endpoint. We don't proactively clear entries on endpoint
+ * unregister — they're per-process and harmless once the underlying
+ * dialogs are gone (the lookup just returns no live session and the
+ * join task skips them).
+ */
+struct cisco_selected {
+	char endpoint_id[128];
+	struct conference_dialog_id dialog_id;
+};
+
+static struct ao2_container *cisco_selected_calls;
+#define CISCO_SELECTED_BUCKETS 31
+
+static int cisco_selected_hash(const void *obj, int flags)
+{
+	const struct cisco_selected *s = obj;
+	/* Hash on endpoint_id ^ call_id — neither is enough alone but the
+	 * combination distributes well across our small bucket count. */
+	return ast_str_case_hash(s->endpoint_id)
+		^ ast_str_hash(s->dialog_id.call_id);
+}
+
+static int cisco_selected_cmp(void *obj, void *arg, int flags)
+{
+	const struct cisco_selected *l = obj;
+	const struct cisco_selected *r = arg;
+
+	if (strcasecmp(l->endpoint_id, r->endpoint_id)
+		|| strcmp(l->dialog_id.call_id, r->dialog_id.call_id)
+		|| strcmp(l->dialog_id.local_tag, r->dialog_id.local_tag)
+		|| strcmp(l->dialog_id.remote_tag, r->dialog_id.remote_tag)) {
+		return 0;
+	}
+	return CMP_MATCH | CMP_STOP;
+}
+
+static void cisco_selected_add(const char *endpoint_id,
+	const struct conference_dialog_id *dialog_id)
+{
+	struct cisco_selected key;
+	struct cisco_selected *existing;
+	struct cisco_selected *fresh;
+
+	if (!cisco_selected_calls || ast_strlen_zero(endpoint_id)) {
+		return;
+	}
+	ast_copy_string(key.endpoint_id, endpoint_id, sizeof(key.endpoint_id));
+	key.dialog_id = *dialog_id;
+
+	existing = ao2_find(cisco_selected_calls, &key, OBJ_SEARCH_OBJECT);
+	if (existing) {
+		ao2_ref(existing, -1);
+		return;  /* idempotent — already selected */
+	}
+
+	fresh = ao2_alloc(sizeof(*fresh), NULL);
+	if (!fresh) {
+		return;
+	}
+	ast_copy_string(fresh->endpoint_id, endpoint_id,
+		sizeof(fresh->endpoint_id));
+	fresh->dialog_id = *dialog_id;
+	ao2_link(cisco_selected_calls, fresh);
+	ao2_cleanup(fresh);
+}
+
+static void cisco_selected_remove(const char *endpoint_id,
+	const struct conference_dialog_id *dialog_id)
+{
+	struct cisco_selected key;
+	struct cisco_selected *existing;
+
+	if (!cisco_selected_calls || ast_strlen_zero(endpoint_id)) {
+		return;
+	}
+	ast_copy_string(key.endpoint_id, endpoint_id, sizeof(key.endpoint_id));
+	key.dialog_id = *dialog_id;
+
+	existing = ao2_find(cisco_selected_calls, &key,
+		OBJ_SEARCH_OBJECT | OBJ_UNLINK);
+	ao2_cleanup(existing);
+}
+
+/*!
+ * \brief Visitor callback for cisco_selected_iterate_for_endpoint.
+ * \retval 0 to continue
+ * \retval !0 to stop iteration (rare; we usually want to visit them all)
+ */
+typedef int (*cisco_selected_visitor)(
+	const struct conference_dialog_id *dialog_id, void *arg);
+
+struct selected_iter_filter {
+	const char *endpoint_id;
+	cisco_selected_visitor visitor;
+	void *visitor_arg;
+};
+
+static int cisco_selected_iter_cb(void *obj, void *arg, int flags)
+{
+	struct cisco_selected *s = obj;
+	struct selected_iter_filter *f = arg;
+
+	if (strcasecmp(s->endpoint_id, f->endpoint_id)) {
+		return 0;
+	}
+	return f->visitor(&s->dialog_id, f->visitor_arg) ? CMP_STOP : 0;
+}
+
+static void cisco_selected_iterate_for_endpoint(const char *endpoint_id,
+	cisco_selected_visitor visitor, void *visitor_arg)
+{
+	struct selected_iter_filter f = {
+		.endpoint_id = endpoint_id,
+		.visitor     = visitor,
+		.visitor_arg = visitor_arg,
+	};
+
+	if (!cisco_selected_calls || ast_strlen_zero(endpoint_id) || !visitor) {
+		return;
+	}
+	ao2_callback(cisco_selected_calls, OBJ_NODATA, cisco_selected_iter_cb,
+		&f);
+}
+
+static int cisco_selected_clear_endpoint_cb(void *obj, void *arg, int flags)
+{
+	const struct cisco_selected *s = obj;
+	const char *endpoint_id = arg;
+	return strcasecmp(s->endpoint_id, endpoint_id) ? 0 : CMP_MATCH;
+}
+
+/*!
+ * \brief Drop all selected-call entries for \a endpoint_id. Called once
+ *        the Join completes so the next Select/Join cycle starts fresh.
+ */
+static void cisco_selected_clear_endpoint(const char *endpoint_id)
+{
+	if (!cisco_selected_calls || ast_strlen_zero(endpoint_id)) {
+		return;
+	}
+	ao2_callback(cisco_selected_calls, OBJ_UNLINK | OBJ_MULTIPLE | OBJ_NODATA,
+		cisco_selected_clear_endpoint_cb, (void *) endpoint_id);
+}
+
 struct conflist_task_data {
 	struct ast_sip_endpoint *endpoint;
 	/* The specific contact that pressed ConfList. Captured at rx time
@@ -354,6 +512,16 @@ static pjsip_module conference_module;       /* forward decl for inc/dec_session
 static void send_holdretrieve_refer(struct conference_task_data *data);
 static void send_conference_completion_notify(struct conference_task_data *data);
 
+/* Forward decls so join_send_task can call the channel-state nudges
+ * shared with conference_send_task — definitions live further down with
+ * the conference helpers. */
+static void mark_channel_as_conference(struct ast_channel *channel,
+	const char *endpoint_id);
+static void indicate_remote_unhold(struct ast_channel *channel,
+	const char *endpoint_id, const char *role);
+static void set_dissolve_on_initiator_hangup(struct ast_channel *channel,
+	const char *endpoint_id);
+
 static void conference_task_data_destroy(void *obj)
 {
 	struct conference_task_data *data = obj;
@@ -375,6 +543,9 @@ enum remotecc_softkey_kind {
 	REMOTECC_SOFTKEY_NONE = 0,
 	REMOTECC_SOFTKEY_CONFLIST,        /* <softkeyeventmsg>ConfList */
 	REMOTECC_SOFTKEY_CONFERENCE,      /* <softkeyeventmsg>Conference */
+	REMOTECC_SOFTKEY_SELECT,          /* <softkeyeventmsg>Select */
+	REMOTECC_SOFTKEY_UNSELECT,        /* <softkeyeventmsg>Unselect */
+	REMOTECC_SOFTKEY_JOIN,            /* <softkeyeventmsg>Join */
 	/* A datapassthroughreq REFER carrying applicationid=1 and (in the
 	 * second multipart part) free-form user_call_data — chan_sip patch's
 	 * ConfList Mute/Remove/Update/<participant> two-step protocol. */
@@ -466,8 +637,14 @@ static int detect_remotecc_softkey(pjsip_msg_body *body,
 		out->kind = REMOTECC_SOFTKEY_CONFLIST;
 	} else if (!strcmp(softkey, "Conference")) {
 		out->kind = REMOTECC_SOFTKEY_CONFERENCE;
+	} else if (!strcmp(softkey, "Select")) {
+		out->kind = REMOTECC_SOFTKEY_SELECT;
+	} else if (!strcmp(softkey, "Unselect")) {
+		out->kind = REMOTECC_SOFTKEY_UNSELECT;
+	} else if (!strcmp(softkey, "Join")) {
+		out->kind = REMOTECC_SOFTKEY_JOIN;
 	} else {
-		/* Not ours — let remotecc.c handle (HLog/MCID/Park/Join/…). */
+		/* Not ours — let remotecc.c handle (HLog/MCID/Park/…). */
 		goto done;
 	}
 
@@ -1078,6 +1255,336 @@ static void queue_conflist_action(struct ast_sip_endpoint *endpoint,
 			data)) {
 		ast_log(LOG_WARNING,
 			"cisco-conference: failed to queue ConfList action task\n");
+		ao2_cleanup(data);
+	}
+}
+
+/* ----------------------------------------------------------------------
+ * Phase 2 (cont.): Join / Select / Unselect softkeys.
+ *
+ * Multi-call merge path. The phone tracks which calls are "selected"
+ * via its own UI; for each Select press we receive a Select REFER and
+ * record the dialog in cisco_selected_calls. Unselect drops a single
+ * entry. Join (pressed on the active call) triggers the merge: the
+ * active call's phone-side becomes the conference anchor; for each
+ * selected (previously-held) call, its remote-side joins the mix and
+ * its phone-side is softhangup'd.
+ *
+ * Wire dance differs from Confrn:
+ *   - The active dialog's session-supplement layer already has
+ *     Refer-Sub: false on our 202 (cisco_send_refer_response handles
+ *     that), so we DO NOT open a UAS dialog for an in-dialog NOTIFY.
+ *   - The cleanup is a single OOB REFER carrying a <notifyreq> body
+ *     with <feature>Join</feature><status>Complete</status> targeting
+ *     the active dialog. Different shape from Confrn's holdretrievereq.
+ *
+ * The active call's phone-side is the anchor (Conference-flagged,
+ * DISSOLVE_HANGUP for cisco_keep_conference=no). Other phone-sides are
+ * softhangup'd outright — unlike Confrn, where chan_phone_a stays.
+ * ---------------------------------------------------------------------- */
+
+/* Hard cap on selected calls per Join. The phone UI realistically caps
+ * at 4-6 lines; chan_sip doesn't impose a limit but our task-data has
+ * to size its buffer. 8 is generous and bounds the worst-case work. */
+#define JOIN_MAX_SELECTED 8
+
+struct join_task_data {
+	struct ast_sip_endpoint *endpoint;
+	struct ast_sip_contact *contact;
+	struct conference_dialog_id active_dialog;
+	struct conference_dialog_id selected[JOIN_MAX_SELECTED];
+	int selected_count;
+	int keep_conference;
+};
+
+static void join_task_data_destroy(void *obj)
+{
+	struct join_task_data *data = obj;
+	ao2_cleanup(data->contact);
+	ao2_cleanup(data->endpoint);
+}
+
+static pjsip_msg_body *join_notifyreq_build(pj_pool_t *pool, void *vctx)
+{
+	struct join_task_data *data = vctx;
+	char xml[1024];
+	pj_str_t type    = pj_str("application");
+	pj_str_t subtype = pj_str("x-cisco-remotecc-request+xml");
+	pj_str_t text;
+
+	snprintf(xml, sizeof(xml),
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+		"<x-cisco-remotecc-request>\n"
+		" <notifyreq>\n"
+		"  <dialogid>\n"
+		"   <callid>%s</callid>\n"
+		"   <localtag>%s</localtag>\n"
+		"   <remotetag>%s</remotetag>\n"
+		"  </dialogid>\n"
+		"  <feature>Join</feature>\n"
+		"  <status>Complete</status>\n"
+		" </notifyreq>\n"
+		"</x-cisco-remotecc-request>\n",
+		data->active_dialog.call_id,
+		data->active_dialog.local_tag,
+		data->active_dialog.remote_tag);
+
+	pj_strdup2(pool, &text, xml);
+	return pjsip_msg_body_create(pool, &type, &subtype, &text);
+}
+
+static void send_join_notifyreq_refer(struct join_task_data *data)
+{
+	cisco_endpoint_send_refer_to_contact(data->endpoint, data->contact,
+		"cisco-conference", "cisco-join-notifyreq",
+		"Join notifyreq REFER",
+		join_notifyreq_build, data);
+}
+
+static int join_send_task(void *obj)
+{
+	struct join_task_data *data = obj;
+	const char *endpoint_id = ast_sorcery_object_get_id(data->endpoint);
+	struct ast_sip_session *session_active = NULL;
+	struct ast_channel *chan_phone_active = NULL;
+	struct ast_channel *chan_remote_active = NULL;
+	struct ast_bridge *bridge_active = NULL;
+	struct ast_bridge *conf = NULL;
+	int joined_count = 0;
+	int i;
+
+	/* Active call — its phone-side becomes the anchor. */
+	session_active = cisco_dialog_session_lookup(
+		data->active_dialog.call_id,
+		data->active_dialog.local_tag,
+		data->active_dialog.remote_tag);
+	if (!session_active) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s Join — active call dialog %s not "
+			"matched to any live session — aborting\n",
+			endpoint_id, data->active_dialog.call_id);
+		goto cleanup;
+	}
+	chan_phone_active = cisco_session_channel_ref(session_active);
+	if (!chan_phone_active) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s Join — active call has no live "
+			"channel — aborting\n", endpoint_id);
+		goto cleanup;
+	}
+	chan_remote_active = ast_channel_bridge_peer(chan_phone_active);
+	if (!chan_remote_active) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s Join — active call has no bridge "
+			"peer — aborting\n", endpoint_id);
+		goto cleanup;
+	}
+	ast_channel_lock(chan_phone_active);
+	bridge_active = ast_channel_get_bridge(chan_phone_active);
+	ast_channel_unlock(chan_phone_active);
+	if (!bridge_active) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s Join — active call's channel "
+			"isn't in a bridge — aborting\n", endpoint_id);
+		goto cleanup;
+	}
+
+	conf = ast_bridge_base_new(
+		AST_BRIDGE_CAPABILITY_MULTIMIX | AST_BRIDGE_CAPABILITY_NATIVE,
+		AST_BRIDGE_FLAG_DISSOLVE_EMPTY | AST_BRIDGE_FLAG_SMART
+			| AST_BRIDGE_FLAG_TRANSFER_BRIDGE_ONLY,
+		"cisco_conference", NULL, NULL);
+	if (!conf) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s Join — ast_bridge_base_new failed; "
+			"aborting\n", endpoint_id);
+		goto cleanup;
+	}
+
+	/* Move the active call's phone-side and remote-side into the conf
+	 * first; it's the anchor. */
+	if (ast_bridge_move(conf, bridge_active, chan_phone_active, NULL, 1)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s Join — failed to move active "
+			"phone-side %s; aborting\n", endpoint_id,
+			ast_channel_name(chan_phone_active));
+		goto cleanup;
+	}
+
+	if (!data->keep_conference) {
+		set_dissolve_on_initiator_hangup(chan_phone_active, endpoint_id);
+	}
+
+	if (ast_bridge_move(conf, bridge_active, chan_remote_active, NULL, 1)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: %s Join — failed to move active "
+			"remote leg %s\n", endpoint_id,
+			ast_channel_name(chan_remote_active));
+		goto cleanup;
+	}
+
+	/* Now walk the selected list: for each one, UNHOLD its remote bridge
+	 * peer, move the remote into conf, and softhangup the phone-side
+	 * anchor. Skip any selected entry that points at the active call
+	 * itself (the phone may have left its active call in the selected
+	 * list — chan_sip's joining loop has the same defensive skip). */
+	for (i = 0; i < data->selected_count; i++) {
+		const struct conference_dialog_id *sel = &data->selected[i];
+		struct ast_sip_session *session_sel = NULL;
+		struct ast_channel *chan_phone_sel = NULL;
+		struct ast_channel *chan_remote_sel = NULL;
+		struct ast_bridge *bridge_sel = NULL;
+
+		if (!strcmp(sel->call_id, data->active_dialog.call_id)
+			&& !strcmp(sel->local_tag, data->active_dialog.local_tag)
+			&& !strcmp(sel->remote_tag, data->active_dialog.remote_tag)) {
+			continue;
+		}
+
+		session_sel = cisco_dialog_session_lookup(sel->call_id,
+			sel->local_tag, sel->remote_tag);
+		if (!session_sel) {
+			ast_log(LOG_NOTICE,
+				"cisco-conference: %s Join — selected dialog %s "
+				"no longer has a live session; skipping\n",
+				endpoint_id, sel->call_id);
+			continue;
+		}
+		chan_phone_sel = cisco_session_channel_ref(session_sel);
+		if (!chan_phone_sel) {
+			ast_log(LOG_NOTICE,
+				"cisco-conference: %s Join — selected dialog %s "
+				"has no live channel; skipping\n",
+				endpoint_id, sel->call_id);
+			ao2_cleanup(session_sel);
+			continue;
+		}
+		chan_remote_sel = ast_channel_bridge_peer(chan_phone_sel);
+		if (!chan_remote_sel) {
+			ast_log(LOG_NOTICE,
+				"cisco-conference: %s Join — selected dialog %s "
+				"has no bridge peer; skipping\n",
+				endpoint_id, sel->call_id);
+			ast_channel_unref(chan_phone_sel);
+			ao2_cleanup(session_sel);
+			continue;
+		}
+		ast_channel_lock(chan_phone_sel);
+		bridge_sel = ast_channel_get_bridge(chan_phone_sel);
+		ast_channel_unlock(chan_phone_sel);
+		if (!bridge_sel) {
+			ast_log(LOG_NOTICE,
+				"cisco-conference: %s Join — selected dialog %s "
+				"has no source bridge; skipping\n",
+				endpoint_id, sel->call_id);
+			ast_channel_cleanup(chan_remote_sel);
+			ast_channel_unref(chan_phone_sel);
+			ao2_cleanup(session_sel);
+			continue;
+		}
+
+		indicate_remote_unhold(chan_remote_sel, endpoint_id,
+			"selected remote leg");
+
+		if (ast_bridge_move(conf, bridge_sel, chan_remote_sel, NULL, 1)) {
+			ast_log(LOG_WARNING,
+				"cisco-conference: %s Join — failed to move "
+				"selected remote leg %s; skipping\n",
+				endpoint_id, ast_channel_name(chan_remote_sel));
+		} else {
+			joined_count++;
+		}
+
+		if (ast_softhangup(chan_phone_sel, AST_SOFTHANGUP_EXPLICIT)) {
+			ast_log(LOG_WARNING,
+				"cisco-conference: %s Join — failed to hang up "
+				"selected phone-side %s\n",
+				endpoint_id, ast_channel_name(chan_phone_sel));
+		} else {
+			ast_log(LOG_NOTICE,
+				"cisco-conference: %s Join — hung up selected "
+				"phone-side %s\n", endpoint_id,
+				ast_channel_name(chan_phone_sel));
+		}
+
+		ao2_cleanup(bridge_sel);
+		ast_channel_cleanup(chan_remote_sel);
+		ast_channel_unref(chan_phone_sel);
+		ao2_cleanup(session_sel);
+	}
+
+	ast_log(LOG_NOTICE,
+		"cisco-conference: %s Join — built %d-way conference "
+		"(active=%s + %d selected leg%s merged)\n",
+		endpoint_id, 2 + joined_count,
+		ast_channel_name(chan_phone_active),
+		joined_count, joined_count == 1 ? "" : "s");
+
+	send_join_notifyreq_refer(data);
+	mark_channel_as_conference(chan_phone_active, endpoint_id);
+
+	cisco_selected_clear_endpoint(endpoint_id);
+
+cleanup:
+	ao2_cleanup(conf);
+	ao2_cleanup(bridge_active);
+	ast_channel_cleanup(chan_remote_active);
+	ast_channel_cleanup(chan_phone_active);
+	ao2_cleanup(session_active);
+	ao2_cleanup(data);
+	return 0;
+}
+
+struct collect_selected_ctx {
+	struct join_task_data *data;
+};
+
+static int collect_selected_visitor(
+	const struct conference_dialog_id *dialog_id, void *arg)
+{
+	struct collect_selected_ctx *ctx = arg;
+	if (ctx->data->selected_count >= JOIN_MAX_SELECTED) {
+		ast_log(LOG_NOTICE,
+			"cisco-conference: Join — more than %d selected calls; "
+			"only the first %d will be merged\n",
+			JOIN_MAX_SELECTED, JOIN_MAX_SELECTED);
+		return 1;  /* stop iteration */
+	}
+	ctx->data->selected[ctx->data->selected_count++] = *dialog_id;
+	return 0;
+}
+
+static void queue_join(struct ast_sip_endpoint *endpoint,
+	struct ast_sip_contact *contact,
+	const struct conference_dialog_id *active_dialog,
+	int keep_conference)
+{
+	struct join_task_data *data;
+	const char *endpoint_id = ast_sorcery_object_get_id(endpoint);
+	struct collect_selected_ctx ctx;
+
+	data = ao2_alloc(sizeof(*data), join_task_data_destroy);
+	if (!data) {
+		return;
+	}
+	ao2_ref(endpoint, +1);
+	data->endpoint = endpoint;
+	ao2_ref(contact, +1);
+	data->contact = contact;
+	data->active_dialog   = *active_dialog;
+	data->keep_conference = keep_conference;
+
+	/* Snapshot the endpoint's current selected list into the task data
+	 * so the task body can iterate without holding any container locks
+	 * and without races against further Select/Unselect REFERs while
+	 * the task runs on the serializer. */
+	ctx.data = data;
+	cisco_selected_iterate_for_endpoint(endpoint_id,
+		collect_selected_visitor, &ctx);
+
+	if (ast_sip_push_task(conference_serializer, join_send_task, data)) {
+		ast_log(LOG_WARNING,
+			"cisco-conference: failed to queue Join task\n");
 		ao2_cleanup(data);
 	}
 }
@@ -1804,6 +2311,30 @@ static pj_bool_t conference_on_rx_request(pjsip_rx_data *rdata)
 				&msg.consult_dialog_id, dlg, keep_conference);
 		}
 		break;
+	case REMOTECC_SOFTKEY_SELECT:
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s pressed Select from %s "
+			"(callid=%s)\n", endpoint_id, contact->uri,
+			msg.dialog_id.call_id);
+		cisco_selected_add(endpoint_id, &msg.dialog_id);
+		cisco_send_refer_response(rdata, 202, endpoint);
+		break;
+	case REMOTECC_SOFTKEY_UNSELECT:
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s pressed Unselect from %s "
+			"(callid=%s)\n", endpoint_id, contact->uri,
+			msg.dialog_id.call_id);
+		cisco_selected_remove(endpoint_id, &msg.dialog_id);
+		cisco_send_refer_response(rdata, 202, endpoint);
+		break;
+	case REMOTECC_SOFTKEY_JOIN:
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s pressed Join from %s "
+			"(active callid=%s)\n", endpoint_id, contact->uri,
+			msg.dialog_id.call_id);
+		cisco_send_refer_response(rdata, 202, endpoint);
+		queue_join(endpoint, contact, &msg.dialog_id, keep_conference);
+		break;
 	default:
 		/* Compiler completeness — kind == NONE already returned above. */
 		break;
@@ -1839,7 +2370,20 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	cisco_selected_calls = ao2_container_alloc_hash(
+		AO2_ALLOC_OPT_LOCK_MUTEX, 0, CISCO_SELECTED_BUCKETS,
+		cisco_selected_hash, NULL, cisco_selected_cmp);
+	if (!cisco_selected_calls) {
+		ao2_cleanup(conflist_pending_actions);
+		conflist_pending_actions = NULL;
+		ast_taskprocessor_unreference(conference_serializer);
+		conference_serializer = NULL;
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
 	if (ast_sip_register_service(&conference_module)) {
+		ao2_cleanup(cisco_selected_calls);
+		cisco_selected_calls = NULL;
 		ao2_cleanup(conflist_pending_actions);
 		conflist_pending_actions = NULL;
 		ast_taskprocessor_unreference(conference_serializer);
@@ -1861,6 +2405,8 @@ static int unload_module(void)
 	}
 
 	ast_sip_unregister_service(&conference_module);
+	ao2_cleanup(cisco_selected_calls);
+	cisco_selected_calls = NULL;
 	ao2_cleanup(conflist_pending_actions);
 	conflist_pending_actions = NULL;
 	ast_taskprocessor_unreference(conference_serializer);

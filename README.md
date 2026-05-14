@@ -2,7 +2,7 @@
 
 Out-of-tree Asterisk modules that add Cisco Enterprise SIP firmware
 support to stock `chan_pjsip` — no Asterisk core patches. Bench-tested
-against CP7975G, CP8841, CP8861 and CP8865 on Asterisk 22.9.x.
+against CP7975G, CP8841, CP8861 and CP8865 on Asterisk 22.9.
 
 ## What works
 
@@ -37,8 +37,8 @@ Palmer's `chan_sip` patch — see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Requirements
 
-- Asterisk 20.x (LTS) or later. CI builds against 20.x, 22.x and 23.x;
-  the primary bench is 22.9.x.
+- Asterisk 20 (LTS) or later. CI builds against 20, 22 and 23; the
+  primary bench is 22.9.
 - Asterisk dev headers (`asterisk-dev` or a self-built source tree).
 - pjproject headers — bundled inside the Asterisk source tree at
   `<asterisk-src>/third-party/pjproject/source/`.
@@ -159,12 +159,13 @@ print-and-stick user reference card live in
 
 ## Compatibility
 
-| Asterisk    | Status                                                       |
-|-------------|--------------------------------------------------------------|
-| 22.9.x      | Primary target; bench-tested against real phones.            |
-| 20.x (LTS)  | Builds clean, CI'd; not yet bench-tested on a phone.         |
-| 23.x        | Builds clean, CI'd; not yet bench-tested on a phone.         |
-| 21.x, ≤19   | Not supported (21 is EOL; ≤19 predates struct fields we use).|
+| Asterisk  | Status                                                |
+|-----------|-------------------------------------------------------|
+| 23        | Builds clean, CI'd; not yet bench-tested on a phone.  |
+| 22 (LTS)  | Primary target; bench-tested against real phones.     |
+| 21        | Not supported (EOL).                                  |
+| 20 (LTS)  | Builds clean, CI'd; not yet bench-tested on a phone.  |
+| ≤19       | Not supported (predates struct fields we use).        |
 
 ## Further reading
 

@@ -75,7 +75,17 @@ endif
 
 CC                   ?= cc
 CFLAGS               ?= -O2 -g
+# Hardening flags on top of -Wall:
+#   -Wstrict-prototypes / -Wmissing-prototypes — catch implicit
+#       declarations and missing static on file-scope helpers (would
+#       otherwise leak into the module's symbol table).
+#   -Wshadow — catch inner-scope shadowing of outer locals (common
+#       footgun in nested loops over media/attrs).
+#   -Wpointer-arith — flag arithmetic on void* / function pointers,
+#       which is non-portable C and a recurring PJSIP code-review nit.
 override CFLAGS      += -fPIC -Wall -Werror -Wno-unused-function \
+                        -Wstrict-prototypes -Wmissing-prototypes \
+                        -Wshadow -Wpointer-arith \
                         -I$(ASTERISK_INCLUDE_DIR) \
                         -Ires \
                         $(PJPROJECT_CFLAGS) \

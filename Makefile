@@ -124,7 +124,18 @@ ENDPOINT_HELPER_OBJS := \
     res/cisco_session.o \
     res/cisco_orig_host.o
 
-OBJS := $(addprefix res/,$(addsuffix .o,$(MODULES))) $(ENDPOINT_HELPER_OBJS)
+# Helper objects that live INSIDE res_pjsip_cisco_conference.so. Not
+# exported across the module boundary; cisco_conference.h is internal.
+# The conference .so links all four objects together; the conference
+# entry point's pjsip_module + load/unload stays in res_pjsip_cisco_
+# conference.c.
+CONFERENCE_HELPER_OBJS := \
+    res/cisco_conf_state.o \
+    res/cisco_conf_list.o \
+    res/cisco_conf_confrn.o
+
+OBJS := $(addprefix res/,$(addsuffix .o,$(MODULES))) \
+        $(ENDPOINT_HELPER_OBJS) $(CONFERENCE_HELPER_OBJS)
 SOS  := $(addprefix res/,$(addsuffix .so,$(MODULES)))
 
 DOC_XML := doc/res_pjsip_cisco-en_US.xml
@@ -142,13 +153,25 @@ all: check-headers $(SOS) $(DOC_XML)
 # header change is rare enough that universal rebuild is the right
 # trade-off.
 #
-# Helper objects (cisco_*.c, *not* res_pjsip_cisco_*.c) get the more-
-# specific rule below: they're linked into res_pjsip_cisco_endpoint.so
-# and any asterisk macro that expands to AST_MODULE_SELF (e.g.
+# Helper objects (cisco_*.c, *not* res_pjsip_cisco_*.c) get more-
+# specific rules below: they're linked into a parent .so and any
+# asterisk macro that expands to AST_MODULE_SELF (e.g.
 # ast_datastore_alloc, ast_calloc_with_stringfields) needs to resolve
-# to the endpoint module's __internal_..._self symbol, not the
-# helper's own basename. Without the override, helpers using such
-# macros emit unresolved-symbol link errors in the .so.
+# to the parent module's __internal_..._self symbol, not the helper's
+# own basename. Without the override, helpers using such macros emit
+# unresolved-symbol link errors in the .so.
+#
+# Conference helpers (cisco_conf_*.c) — shorter stem wins in GNU make's
+# pattern rule precedence, so this matches before the broader
+# cisco_%.o rule for these files.
+res/cisco_conf_%.o: res/cisco_conf_%.c $(wildcard res/cisco_*.h)
+	$(CC) $(CFLAGS) \
+	    -UAST_MODULE_SELF_SYM \
+	    -DAST_MODULE_SELF_SYM=__internal_res_pjsip_cisco_conference_self \
+	    -DAST_MODULE=\"res_pjsip_cisco_conference\" \
+	    -c $< -o $@
+
+# Endpoint helpers (every other cisco_*.c).
 res/cisco_%.o: res/cisco_%.c $(wildcard res/cisco_*.h)
 	$(CC) $(CFLAGS) \
 	    -UAST_MODULE_SELF_SYM \
@@ -168,6 +191,17 @@ res/res_pjsip_cisco_endpoint.so: \
     res/res_pjsip_cisco_endpoint.exports
 	$(CC) $(LDFLAGS) \
 	    -Wl,--version-script=res/res_pjsip_cisco_endpoint.exports \
+	    -o $@ \
+	    $(filter %.o,$^)
+
+# Conference module: link entry + conference helpers into one .so. The
+# .exports keeps everything local — these helpers don't cross module
+# boundaries.
+res/res_pjsip_cisco_conference.so: \
+    res/res_pjsip_cisco_conference.o $(CONFERENCE_HELPER_OBJS) \
+    res/res_pjsip_cisco_conference.exports
+	$(CC) $(LDFLAGS) \
+	    -Wl,--version-script=res/res_pjsip_cisco_conference.exports \
 	    -o $@ \
 	    $(filter %.o,$^)
 

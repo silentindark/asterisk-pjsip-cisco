@@ -75,17 +75,38 @@ endif
 
 CC                   ?= cc
 CFLAGS               ?= -O2 -g
-# Hardening flags on top of -Wall:
-#   -Wstrict-prototypes / -Wmissing-prototypes — catch implicit
-#       declarations and missing static on file-scope helpers (would
-#       otherwise leak into the module's symbol table).
-#   -Wshadow — catch inner-scope shadowing of outer locals (common
-#       footgun in nested loops over media/attrs).
-#   -Wpointer-arith — flag arithmetic on void* / function pointers,
-#       which is non-portable C and a recurring PJSIP code-review nit.
+# Hardening flags on top of -Wall.
+#
+# Prototype / declaration hygiene:
+#   -Wstrict-prototypes      — flag K&R f() declarations (must be f(void)).
+#   -Wmissing-prototypes     — flag non-static functions with no prior
+#                              declaration in a header.
+#   -Wmissing-declarations   — counterpart on the definition side: a
+#                              non-static definition must match a prior
+#                              declaration.
+#   -Wold-style-definition   — flag K&R definitions f() instead of f(void).
+#   -Wnested-externs         — disallow extern inside function bodies.
+#
+# Bug-class detectors:
+#   -Wshadow                 — inner-scope shadowing of outer locals.
+#   -Wpointer-arith          — arithmetic on void* / function pointers.
+#   -Wjump-misses-init       — goto/switch that skips a local init.
+#   -Wlogical-op             — suspicious || / && (constant operands,
+#                              same operand on both sides).
+#   -Wduplicated-cond        — `if (x) ... else if (x) ...` typos.
+#   -Wduplicated-branches    — identical then/else bodies (copy-paste bugs).
+#   -Wvla                    — variable-length arrays (Asterisk style
+#                              prefers fixed-size buffers).
+#   -Wformat=2               — stricter format-string checking on top of
+#                              -Wall's -Wformat (catches non-literal
+#                              format strings and %n misuse).
 override CFLAGS      += -fPIC -Wall -Werror -Wno-unused-function \
                         -Wstrict-prototypes -Wmissing-prototypes \
-                        -Wshadow -Wpointer-arith \
+                        -Wmissing-declarations -Wold-style-definition \
+                        -Wnested-externs \
+                        -Wshadow -Wpointer-arith -Wjump-misses-init \
+                        -Wlogical-op -Wduplicated-cond -Wduplicated-branches \
+                        -Wvla -Wformat=2 \
                         -I$(ASTERISK_INCLUDE_DIR) \
                         -Ires \
                         $(PJPROJECT_CFLAGS) \

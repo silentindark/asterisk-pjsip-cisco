@@ -1,5 +1,160 @@
 # Changelog
 
+## v0.4.0 — 2026-05-15
+
+Bench-debugged release: every behavioural change here was prompted
+by a real failure observed on the live fleet (8865 / 8861 / 7975 /
+2N IP Verso door) and verified back to working on the same wires.
+Two headline video fixes (phantom-stream suppression on
+video-to-voice-only calls; correct softmix routing in 3+ party
+conferences with video), plus the H.264 imageattr propagation path
+Gareth's chan_sip patch carried in core. Internals: the conference
+module split into focused files, two rounds of compiler hardening
+that the whole codebase now passes clean, and a `make tests`
+harness with smoke checks wired into CI.
+
+### New behaviour
+
+- **H.264 imageattr propagation across the bridge**
+  (`res_pjsip_cisco_call_extras`). When a Cisco endpoint's incoming
+  SDP carries `a=imageattr` on H.264 payloads, it's stashed on the
+  receiving leg's `ast_channel` via an `ast_datastore`. When the
+  outgoing answer is built on the bridge peer leg, that value is
+  mirrored (rewritten with the payload number of our own H.264
+  format) instead of the static `[x=640,y=480,q=0.50]` fallback.
+  SDP-level equivalent of Gareth's core-format-attribute widening;
+  replacing the stock `res_format_attr_h264` interface from
+  out-of-tree isn't viable
+  (`__ast_format_interface_register` refuses a second registration
+  for `"h264"`).
+
+  Lookup uses a two-phase peer find: `ast_channel_bridge_peer()`
+  when the bridge is formed (precise, handles 3+ party correctly
+  by returning NULL), with a linkedid-walk + per-candidate
+  aggregation fallback for the pre-bridge window — chan_pjsip
+  emits the answering 200 OK during `ast_answer()`, which
+  `app_dial` calls *before* `ast_bridge_call()`, so the bridge
+  doesn't exist yet at SDP-patch time. Bench-verified after that
+  race was caught in trace.
+
+- **Phantom video answer suppression on voice-only callees**
+  (`res_pjsip_cisco_call_extras`). When an 8865 (or any video
+  phone) dials a voice-only endpoint, chan_pjsip's default
+  `codec_prefs_*_answer = keep:all` kept the offered video media
+  line in the answer back to the caller. The 8865 opened its
+  video-receive pane on the advertised port, never saw frames,
+  and painted a black box for the duration of the call. Now
+  rejected with `port=0` (RFC 3264 §6) when the bridge peer leg
+  observably had no video. The lookup aggregates across every
+  linkedid-matching candidate so helper channels (`Local;1`,
+  parking) with no datastore are conservatively skipped, and
+  multi-party "any peer has video" is handled correctly without
+  misfiring against an audio-only trunk participant.
+
+- **Conference bridge video routing mode**
+  (`res_pjsip_cisco_conference`). Asterisk's softmix bridge
+  defaults to `AST_BRIDGE_VIDEO_MODE_NONE`, which drops every
+  video RTP frame between participants. Our Confrn/Join created
+  the multimix bridge with the SMART flag (auto-promotes 2-party
+  native → 3-party softmix the moment a third leg joins) but
+  never called `ast_bridge_set_*_video_mode()`. Symptom observed
+  live: door-camera video on an 8865 went black the instant a
+  third (audio-only mobile) leg was Confrn'd into the call. Now
+  auto-picks per actual participant capability:
+
+  - Exactly one video-capable participant → `SINGLE_SRC` pinned
+    to it. Right for the door-camera-into-audio-conference shape:
+    forward the camera feed regardless of who's talking.
+  - Two or more video-capable → `TALKER_SRC`. Standard multi-
+    party video-conference behaviour. The door-intercom case
+    falls into this branch (the 8865's own native formats include
+    h264 too) and still works correctly because the door has a
+    microphone — whenever audio is active at the door the bridge
+    selects the door's video; sustained selection means the camera
+    stays visible even when the user talks.
+  - Zero video-capable → `TALKER_SRC` (harmless; keeps the bridge
+    in a defined state for late-joining video peers).
+
+### Internals
+
+- **`res_pjsip_cisco_conference.c` split into focused files**.
+  The single 2570-line .c was past the comfortable-navigation
+  threshold. Split along the section seams the existing comments
+  already pointed out:
+  - `res_pjsip_cisco_conference.c` — module entry, REFER body
+    parsing, softkey dispatch, load/unload (~570 lines).
+  - `cisco_conf_state.c` — pending-action + selected-call ao2
+    containers and the channel-state helpers shared across all
+    action paths (~390 lines).
+  - `cisco_conf_list.c` — ConfList menu build + send, plus the
+    Mute/Remove/Update action two-step state machine (~530
+    lines).
+  - `cisco_conf_confrn.c` — Confrn 3-way build with post-merge
+    wire dance, Join multi-call merge, RmLastConf (~1010 lines).
+
+  Cross-file declarations in `cisco_conference.h` (internal — not
+  exported across the .so boundary). Strict refactor, no
+  behaviour change.
+
+- **Two rounds of compiler hardening**. On top of the existing
+  `-Wall -Werror -Wno-unused-function`, the Makefile now passes:
+  `-Wstrict-prototypes`, `-Wmissing-prototypes`,
+  `-Wmissing-declarations`, `-Wold-style-definition`,
+  `-Wnested-externs`, `-Wshadow`, `-Wpointer-arith`,
+  `-Wjump-misses-init`, `-Wlogical-op`, `-Wduplicated-cond`,
+  `-Wduplicated-branches`, `-Wvla`, `-Wformat=2`. Builds clean
+  across the 20.x / 22.x / 23.x matrix without any code changes
+  required — the codebase was already disciplined enough to pass
+  all of them. `-Wbad-function-cast` deliberately omitted: it
+  fires inside Asterisk's own `include/asterisk/time.h` (cast of
+  a double-returning function to long int), which is out of our
+  hands.
+
+- **`debian/control` refreshed for v0.3.0+** — description now
+  covers Conference Phase 1, Record softkey, prt-report,
+  presence-driven BLF, and the global `on_tx_request` NAT hook.
+  CI-only Build-Depends (`wget`, `ca-certificates`) dropped from
+  the real package metadata.
+
+- **`AGENTS.md` repo-structure paragraph** updated to describe
+  the six topical shared-helper headers in `res/` (split from
+  the single header in v0.3.0).
+
+### Tooling
+
+- **`make tests` target** with two flavours:
+  - `smoke` — `xmllint` on the generated `doc/res_pjsip_cisco-en_US.xml`
+    plus `readelf`-based `__mod_info` / `load_module` /
+    `unload_module` symbol checks for each `.so`. Catches
+    "module silently refuses to register at startup" failure
+    modes that previous build-only CI couldn't see.
+  - `unit` — pjlib-linked standalone C programs with `assert()`s.
+    Pins behaviour of pjlib primitives (`pj_stricmp2`, `pj_strchr`,
+    `pj_str`) we rely on across pjproject versions. Ships
+    asterisk-stub allocator wrappers (`__ast_repl_malloc`,
+    `__ast_free`) so the test binary links without libasterisk.
+  - Documents the NDEBUG-from-pjproject gotcha (`pjproject/config_site.h`
+    defines `NDEBUG`, silently turning `assert()` into `((void)0)`
+    unless test files `#undef NDEBUG` before including
+    `<assert.h>`) and the `-O0` requirement so assertions actually
+    evaluate at runtime instead of constant-folding away.
+
+- **CI runs `smoke.sh`** after the build matrix produces .so files
+  and the doc XML. Unit half deliberately not in CI — those tests
+  link against pjproject static libs which CI doesn't build (it
+  only `./configure`s pjproject for headers, never `make`s).
+
+- **CI compatibility fix**: the new `-Wstrict-prototypes` flag
+  fires on stock pjproject's `pj_thread_unregister()` K&R-style
+  declaration (`pjlib/include/pj/os.h:267`). Asterisk's own build
+  applies `0010-pj_thread_unregister_void.patch` from
+  `third-party/pjproject/patches/`, but 20.x doesn't carry it,
+  and CI resolves the asterisk tag at runtime. CI now sed-fixes
+  the one-line declaration directly — idempotent and version-
+  independent across pjproject 2.14 (asterisk 20.x) and 2.16
+  (asterisk 22.x/23.x). Local builds were always fine because
+  bundled pjproject ships the patch pre-applied.
+
 ## v0.3.0 — 2026-05-15
 
 Headline additions are the Conference feature (Phase 1: Confrn-built

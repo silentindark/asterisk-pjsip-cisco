@@ -1,3 +1,32 @@
+asterisk-pjsip-cisco (0.4.0-1) unstable; urgency=medium
+
+  * H.264 imageattr propagation across the bridge: incoming SDP
+    imageattr stashed on the receiving leg's ast_channel, mirrored
+    onto the bridge peer's outgoing answer (replaces static fallback).
+    Two-phase peer find handles both post-bridge (ast_channel_bridge_peer)
+    and pre-bridge (linkedid walk with aggregation) lookups.
+  * Phantom video answer suppression: when a video phone dials a
+    voice-only endpoint, the answer's m=video stream is now rejected
+    with port=0 instead of leaving the caller's video pane open
+    waiting for frames that never arrive. Aggregation across
+    linkedid candidates skips helper channels with no datastore.
+  * Conference bridge video mode: Confrn and Join now call
+    ast_bridge_set_*_video_mode() on the multimix bridge, auto-
+    picking SINGLE_SRC (one video peer) or TALKER_SRC (multi-video)
+    based on participant capability. Fixes black-video in Confrn'd
+    door-camera-into-mobile calls.
+  * Internals: res_pjsip_cisco_conference.c split into focused
+    sibling files (cisco_conf_state.c, cisco_conf_list.c,
+    cisco_conf_confrn.c) sharing declarations via cisco_conference.h.
+  * Tooling: make tests target with smoke (xmllint + readelf
+    symbol checks on every .so) and pjlib-linked unit harness.
+    Smoke wired into CI; expanded -W* hardening flags applied
+    across the codebase (clean on 20.x / 22.x / 23.x).
+  * Bench-debugged against CP-8865 + CP-8861 + CP-7975 + 2N IP Verso
+    door intercom on Asterisk 22.9.
+
+ -- Andrew Simmonds <simmo@rinseout.org>  Fri, 15 May 2026 23:30:46 +0800
+
 asterisk-pjsip-cisco (0.3.0-1) unstable; urgency=medium
 
   * Conference Phase 1: Confrn-built multimix bridge with phone-side

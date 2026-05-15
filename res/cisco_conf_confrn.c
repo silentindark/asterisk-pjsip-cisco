@@ -33,6 +33,7 @@
 #include "asterisk/bridge.h"
 #include "asterisk/channel.h"
 #include "asterisk/callerid.h"
+#include "asterisk/format_cap.h"
 #include "asterisk/strings.h"
 #include "asterisk/utils.h"
 #include "asterisk/taskprocessor.h"
@@ -45,6 +46,107 @@
 #include "cisco_refer.h"
 #include "cisco_session.h"
 #include "cisco_conference.h"
+
+/* ----------------------------------------------------------------------
+ * Shared: pick the bridge's video routing mode.
+ *
+ * Asterisk's softmix bridge defaults to AST_BRIDGE_VIDEO_MODE_NONE,
+ * which drops every video RTP frame between participants. With the
+ * SMART flag on a multimix bridge that auto-promotes 2-party-native
+ * -> 3-party-softmix during a Confrn or Join, that default kicks in
+ * the moment the third channel joins — and the only-video-capable
+ * participant's stream goes black on every other participant's
+ * screen. Symptom observed live on 2026-05-15: door-camera video
+ * disappeared from the 8865 the instant a mobile leg was Confrn'd
+ * into the call.
+ *
+ * Pick the mode per actual participant capability:
+ *
+ *   exactly one video-capable channel
+ *       -> SINGLE_SRC pinned to it. Right for the door-camera-into-
+ *          audio-conference case: always forward the camera feed
+ *          regardless of who's talking. Other participants without
+ *          a screen (a SIP trunk to a mobile) get the frames and
+ *          drop them harmlessly.
+ *
+ *   two or more video-capable channels
+ *       -> TALKER_SRC. Bridge forwards whichever video participant
+ *          is currently the active audio talker — the standard
+ *          multi-party video-conference behaviour Cisco SX10 /
+ *          Polycom RealPresence / etc use.
+ *
+ *   zero video-capable channels
+ *       -> TALKER_SRC. Harmless (nothing to route either way) and
+ *          keeps the bridge in a defined state if a video peer
+ *          arrives later via a transfer/join.
+ *
+ * "Video-capable" is read off the channel's negotiated native
+ * formats — set during the call's SDP exchange, stable by the time
+ * we're forming the conference. ast_format_cap_has_type returns 1
+ * if ANY video format is present, which correctly handles
+ * sendonly-camera peers (door has video in its native formats even
+ * though it won't accept video back) and rejects audio-only peers
+ * (mobile/trunk with no h264 in its codec list).
+ */
+/*!
+ * \brief If \a chan advertises any video format in its native
+ *        capability set, bump the running tally and remember the
+ *        channel as a potential SINGLE_SRC anchor.
+ *
+ * Used as a per-participant probe by both conference_send_task
+ * (called three times across known channel pointers) and
+ * join_send_task (called incrementally inside the selected-leg
+ * loop, where chan_remote_sel pointers don't survive past their
+ * iteration). The tally is later consumed by apply_bridge_video_mode.
+ */
+static void tally_video_participant(struct ast_channel *chan,
+	struct ast_channel **video_src, int *video_count)
+{
+	struct ast_format_cap *caps;
+
+	if (!chan) {
+		return;
+	}
+	caps = ast_channel_nativeformats(chan);
+	if (caps && ast_format_cap_has_type(caps, AST_MEDIA_TYPE_VIDEO)) {
+		*video_src = chan;
+		++(*video_count);
+	}
+}
+
+/*!
+ * \brief Set the bridge's video routing mode based on the participant
+ *        tally produced by tally_video_participant.
+ *
+ * exactly 1 video-capable -> SINGLE_SRC pinned to that channel.
+ * 0 or 2+                  -> TALKER_SRC (follows the active audio
+ *                             talker). 0 is harmless (nothing to
+ *                             route) and keeps the bridge in a
+ *                             defined state in case a video peer
+ *                             arrives later via transfer/join.
+ *
+ * \a video_src must still be in the bridge at this call site —
+ * the function reads its name for the log line; it doesn't take
+ * an additional ref.
+ */
+static void apply_bridge_video_mode(struct ast_bridge *bridge,
+	struct ast_channel *video_src, int video_count,
+	const char *endpoint_id)
+{
+	if (video_count == 1) {
+		ast_bridge_set_single_src_video_mode(bridge, video_src);
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s — bridge video mode SINGLE_SRC "
+			"pinned to %s (only video-capable participant)\n",
+			endpoint_id, ast_channel_name(video_src));
+	} else {
+		ast_bridge_set_talker_src_video_mode(bridge);
+		ast_log(LOG_NOTICE,
+			"cisco-conference: %s — bridge video mode TALKER_SRC "
+			"(%d video-capable participants)\n",
+			endpoint_id, video_count);
+	}
+}
 
 /* ----------------------------------------------------------------------
  * Confrn — 3-way conference build.
@@ -371,6 +473,17 @@ static int conference_send_task(void *obj)
 	}
 	cisco_conf_mark_joined(chan_remote_b);
 
+	{
+		struct ast_channel *video_src = NULL;
+		int video_count = 0;
+
+		tally_video_participant(chan_phone_a, &video_src, &video_count);
+		tally_video_participant(chan_remote_a, &video_src, &video_count);
+		tally_video_participant(chan_remote_b, &video_src, &video_count);
+		apply_bridge_video_mode(conf, video_src, video_count,
+			endpoint_id);
+	}
+
 	if (ast_softhangup(chan_phone_b, AST_SOFTHANGUP_EXPLICIT)) {
 		ast_log(LOG_WARNING,
 			"cisco-conference: %s — failed to hang up consult-side "
@@ -658,6 +771,8 @@ static int join_send_task(void *obj)
 	struct ast_channel *chan_remote_active = NULL;
 	struct ast_bridge *bridge_active = NULL;
 	struct ast_bridge *conf = NULL;
+	struct ast_channel *video_src = NULL;
+	int video_count = 0;
 	int joined_count = 0;
 	int i;
 
@@ -732,6 +847,9 @@ static int join_send_task(void *obj)
 	}
 	cisco_conf_mark_joined(chan_remote_active);
 
+	tally_video_participant(chan_phone_active, &video_src, &video_count);
+	tally_video_participant(chan_remote_active, &video_src, &video_count);
+
 	/* Now walk the selected list: for each one, UNHOLD its remote bridge
 	 * peer, move the remote into conf, and softhangup the phone-side
 	 * anchor. Skip any selected entry that points at the active call
@@ -802,6 +920,8 @@ static int join_send_task(void *obj)
 				endpoint_id, ast_channel_name(chan_remote_sel));
 		} else {
 			cisco_conf_mark_joined(chan_remote_sel);
+			tally_video_participant(chan_remote_sel,
+				&video_src, &video_count);
 			joined_count++;
 		}
 
@@ -829,6 +949,12 @@ static int join_send_task(void *obj)
 		endpoint_id, 2 + joined_count,
 		ast_channel_name(chan_phone_active),
 		joined_count, joined_count == 1 ? "" : "s");
+
+	/* video_src may point to a chan_remote_sel whose LOCAL ref was
+	 * released at end of its loop iteration — that's fine, the
+	 * bridge still holds its own ref so the channel object remains
+	 * alive until it leaves the bridge. */
+	apply_bridge_video_mode(conf, video_src, video_count, endpoint_id);
 
 	send_join_notifyreq_refer(data);
 	mark_channel_as_conference(chan_phone_active, endpoint_id);

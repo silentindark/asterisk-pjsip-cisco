@@ -4,7 +4,7 @@
 
 This repository builds out-of-tree Asterisk `res_pjsip_cisco_*` shared modules for Cisco Enterprise SIP firmware support.
 
-- `res/` contains the C modules, shared helper header (`cisco_endpoint.h`), module export files, and generated `.so` build outputs.
+- `res/` contains the C modules, six topical shared-helper headers (`cisco_endpoint.h`, `cisco_rdata.h`, `cisco_register.h`, `cisco_refer.h`, `cisco_session.h`, `cisco_orig_host.h`) with bodies in sibling `cisco_*.c` files compiled into `res_pjsip_cisco_endpoint.so`, per-module export files, and generated `.so` build outputs.
 - `doc/` contains generated Asterisk XML documentation (`res_pjsip_cisco-en_US.xml`).
 - `conf-samples/` contains sample `pjsip.conf` Cisco sections.
 - `debian/` contains Debian packaging metadata and `debian/rules`.

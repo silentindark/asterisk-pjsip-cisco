@@ -1,3 +1,24 @@
+asterisk-pjsip-cisco (0.3.0-1) unstable; urgency=medium
+
+  * Conference Phase 1: Confrn-built multimix bridge with phone-side
+    UI promotion (holdretrievereq + Cisco-flavoured in-dialog NOTIFY +
+    Event:refer NOTIFY), ConfList read + Mute/Remove/Update action
+    softkeys, Join/Select/Unselect multi-call merge, RmLastConf, and
+    cisco_keep_conference for initiator-hangup behaviour.
+  * DND / CFwdALL / HuntGroup CLIs and CISCO_*() dialplan functions;
+    writes also push a bulkupdate REFER so phone-side UI updates in
+    real time. DND additionally drives BLF lamps via a Cisco
+    presence-state provider.
+  * Record softkey (StartRecording / StopRecording) via MixMonitor on
+    the bridged channel.
+  * pjsip cisco prt-report CLI.
+  * Internals: helper bodies moved into res_pjsip_cisco_endpoint.so as
+    shared symbols; NAT'd-contact RURI rewrite globalised as an
+    on_tx_request hook so REFER + NOTIFY both pick it up.
+  * Bench-tested against Asterisk 20.19, 22.9, and 23.3.
+
+ -- Andrew Simmonds <simmo@rinseout.org>  Fri, 15 May 2026 11:41:26 +0800
+
 asterisk-pjsip-cisco (0.1.0-1) unstable; urgency=medium
 
   * Initial release — early 0.x; wants real-world testing before 1.0.

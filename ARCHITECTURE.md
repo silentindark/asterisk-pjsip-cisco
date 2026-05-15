@@ -393,10 +393,22 @@ traffic for Cisco endpoints. It appends `X-cisco-sis-10.0.0` to
 `Supported`, sends `Call-Info:
 <urn:x-cisco-remotecc:callinfo>;orientation=...;security=...`, carries
 `CISCO_CALLBACK_NUMBER` as `x-cisco-callback-number` in
-Remote-Party-ID, and adds the legacy H.264 video SDP hints
-`b=TIAS:4000000` plus default `imageattr` when stock SDP has no
-imageattr. `CISCO_HUNTPILOT` is also represented as `huntpiloturi` in
-Call-Info for outbound calls to the phone.
+Remote-Party-ID, and adds Cisco-side H.264 video SDP hints
+`b=TIAS:4000000` plus default `imageattr` when an outgoing Cisco
+INVITE/200 carries H.264 without imageattr. `CISCO_HUNTPILOT` is also
+represented as `huntpiloturi` in Call-Info for outbound calls to the
+phone.
+
+This is intentionally narrower than the cisco-usecallmanager patch's
+core H.264 support. Gareth's patch changes `res_format_attr_h264.c` so
+`imageattr` becomes an Asterisk H.264 format attribute, parses incoming
+`a=imageattr` into that attribute in chan_sip SDP handling, and emits it
+again from the negotiated format on the other bridge leg. This
+out-of-tree module only rewrites the outgoing SDP body on Cisco endpoint
+sessions; it does not make `imageattr` survive Asterisk's media
+capability negotiation or propagate it to a non-Cisco channel. Full
+parity would require core/PJSIP SDP changes, not just another Cisco
+supplement.
 
 ### res_pjsip_cisco_conference
 

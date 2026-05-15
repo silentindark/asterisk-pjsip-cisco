@@ -1,17 +1,99 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 — 2026-05-15
 
+Headline additions are the Conference feature (Phase 1: Confrn-built
+multimix bridge with phone-side UI promotion, ConfList read + action
+softkeys, multi-call merge via Join / Select / Unselect, RmLastConf),
+DND / CFwdALL / HuntGroup CLIs + dialplan functions wired to BLF
+lamps, the Record softkey, and a service-control PRT report CLI.
+Internals: helper bodies now live in `res_pjsip_cisco_endpoint.so` so
+every other module shares one canonical implementation, and the
+NAT'd-contact RURI rewrite moved out of `res_pjsip_cisco_unsolicited_blf`
+into a global `on_tx_request` hook covering every outbound request.
+Bench-tested on Asterisk 20.19, 22.9, and 23.3.
+
+### New features
+
+- **Conference softkey** (`res_pjsip_cisco_conference`). Phase 1
+  end-to-end: the in-call Conference softkey builds a real multimix
+  bridge and joins the held leg, with the post-Confrn wire dance —
+  `holdretrievereq` + in-dialog Cisco-flavoured NOTIFY carrying an
+  RFC 3515 sipfrag body + Event:refer NOTIFY — so the phone-side UI
+  promotes to a Conference glyph and un-holds without the user
+  touching anything. The Join / Select / Unselect softkeys merge
+  multiple held calls into one bridge. RmLastConf removes the
+  most-recently-joined participant (tracked per channel in
+  `cisco_session`). The ConfList softkey returns the participant
+  menu; its Mute / Remove / Update action softkeys are now wired
+  through to the bridge. `cisco_keep_conference` controls whether
+  the bridge survives initiator hangup.
+- **DND / CFwdALL / HuntGroup CLIs and dialplan functions**
+  (`res_pjsip_cisco_feature_events` + shared helpers). New CLIs
+  `pjsip cisco {dnd,huntgroup,cfwdall} <endpoint> [on|off|number]`
+  and dialplan functions `CISCO_DND()`, `CISCO_HUNTGROUP()`,
+  `CISCO_CFWDALL()` (read + write) drive the same astdb state the
+  softkey SUBSCRIBEs maintain; a write also pushes a bulkupdate
+  REFER so the phone-side toggle/icon updates in real time. DND
+  state additionally drives BLF lamps via a Cisco presence-state
+  provider — hints can watch a DND'd line and the lamp goes red.
 - **Record softkey** (`StartRecording` / `StopRecording`) in
-  `res_pjsip_cisco_remotecc`. Resolves the softkey REFER's `<dialogid>`
-  to the phone's channel and runs `MixMonitor` (or `StopMixMonitor`) on
-  it off the SIP rx thread, defaulting to filename
-  `cisco-<endpoint>-<uniqueid>.wav` under the configured MixMonitor
-  directory. Override per call by setting `CISCO_RECORD_FILENAME` on
-  the channel from dialplan. chan_sip's `cisco-usecallmanager` patch
-  approaches the same softkey by creating a second SIP dialog and
-  dispatching to extension `record`; in chan_pjsip a direct MixMonitor
-  on the bridged channel gives the same result.
+  `res_pjsip_cisco_remotecc`. Resolves the softkey REFER's
+  `<dialogid>` to the phone's channel and runs `MixMonitor` (or
+  `StopMixMonitor`) on it off the SIP rx thread, defaulting to
+  filename `cisco-<endpoint>-<uniqueid>.wav` under the configured
+  MixMonitor directory. Override per call by setting
+  `CISCO_RECORD_FILENAME` on the channel from dialplan. chan_sip's
+  `cisco-usecallmanager` patch approaches the same softkey by
+  creating a second SIP dialog and dispatching to extension
+  `record`; in chan_pjsip a direct MixMonitor on the bridged
+  channel gives the same result.
+- **`pjsip cisco prt-report <endpoint> [contact]` CLI**
+  (`res_pjsip_cisco_service_control`). Triggers the phone's
+  Problem Report Tool upload via the same service-control NOTIFY
+  channel as `check-sync` / `restart` / `reset`.
+
+### Internals
+
+- **Shared helpers compiled into `res_pjsip_cisco_endpoint.so`**.
+  `cisco_endpoint.h` was split into six topical headers
+  (`cisco_endpoint.h`, `cisco_rdata.h`, `cisco_register.h`,
+  `cisco_refer.h`, `cisco_session.h`, `cisco_orig_host.h`) carrying
+  declarations only; bodies live in sibling `.c` files that compile
+  into the endpoint `.so` and are exported globally so every other
+  module resolves them via the loader's `RTLD_GLOBAL` pass on
+  `AST_MODFLAG_GLOBAL_SYMBOLS`. Same pattern stock Asterisk uses
+  for `ast_sip_*` in `res_pjsip.so`. Before this, helpers were
+  inline in headers and each consumer compiled its own copy.
+- **NAT'd-contact RURI/To rewrite moved to a global `on_tx_request`
+  hook** (`cisco_orig_host` inside `res_pjsip_cisco_endpoint.so`).
+  When `res_pjsip_nat`'s `rewrite_contact=yes` leaves an
+  `x-ast-orig-host` URI parameter on the Contact-derived RURI, the
+  hook rewrites the Request-URI and To-URI back to the phone's
+  self-advertised host:port. Cisco firmware on NAT'd phones rejected
+  unsolicited NOTIFYs / REFERs with `400 Bad Request` because the
+  public NAT mapping in the RURI didn't match what the phone knew
+  about itself. The hook is a strict no-op for any URI without the
+  parameter — LAN-registered contacts, upstream trunks, non-NAT'd
+  targets all pass through unchanged. The earlier per-module
+  rewrite that lived in `res_pjsip_cisco_unsolicited_blf` (and
+  never covered REFER) is gone.
+- **`res_pjsip_cisco_feature_events` PATH A removed**. The
+  `as-feature-event` SUBSCRIBE handler turned out to be dead in
+  chan_pjsip — firmware uses RemoteCC REFERs instead. The only
+  remaining path is PATH B (astdb-backed feature state).
+- **`Makefile` propagates `SELF_SYM` into helper objects** so the
+  helper `.c` files compiled into `res_pjsip_cisco_endpoint.so` link
+  against the parent module's self-symbol instead of an undefined
+  one.
+
+### Docs
+
+- README rewritten as a user-facing feature tour with a
+  compatibility table covering Asterisk 20.x → 23.x and bench-tested
+  status per release.
+- ARCHITECTURE.md tracks the landed Conference + RemoteCC work, the
+  shared-helpers `.so` pattern, and `cisco_orig_host`'s role.
 
 ## v0.1.0 — 2026-05-13
 

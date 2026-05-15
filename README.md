@@ -40,8 +40,8 @@ bench-tested against CP7975G, CP8841, CP8861 and CP8865 on Asterisk
 - Conference softkeys: Confrn (3-way build), Join (multi-call merge),
   RmLastConf (remove most-recent participant), ConfList (read-only
   participant list).
-- MCID, callback-number RPID, H.264 SDP hints, Call-Info RemoteCC
-  metadata and other call-signaling extras the firmware expects.
+- MCID, callback-number RPID, Cisco-side H.264 SDP hints, Call-Info
+  RemoteCC metadata and other call-signaling extras the firmware expects.
 
 ### Cisco Signalling
 

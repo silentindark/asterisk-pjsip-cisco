@@ -1,3 +1,14 @@
+asterisk-pjsip-cisco (0.4.1-1) unstable; urgency=medium
+
+  * Docs-only: trim conf-samples/extensions.conf.cisco-features.sample
+    to just the Park integration (the one operator-config step
+    the project still needs). Removed obsolete pre-v0.3.0 conference
+    workarounds (meet-me 8001-8009, chained-transfer *0NNNN) and
+    generic-Asterisk features (group pickup, *97 voicemail) that
+    weren't Cisco-specific. 169 -> 52 lines. No runtime change.
+
+ -- Andrew Simmonds <simmo@rinseout.org>  Fri, 15 May 2026 23:40:00 +0800
+
 asterisk-pjsip-cisco (0.4.0-1) unstable; urgency=medium
 
   * H.264 imageattr propagation across the bridge: incoming SDP

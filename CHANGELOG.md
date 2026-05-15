@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.4.1 — 2026-05-15
+
+Docs-only patch. The shipped
+`conf-samples/extensions.conf.cisco-features.sample` was carrying
+~140 lines of obsolete workarounds and generic-Asterisk dialplan
+that pre-dated v0.3.0's native Confrn / Join / RmLastConf / action-
+softkey support. Trimmed to just the Park integration with
+`res_parking`, which is the one operator-config step the project
+actually needs (the RemoteCC Park softkey blind-transfers to
+`<parkext>@<context>`, and that needs to resolve to `Park()`).
+
+Removed:
+
+- Ad-hoc `ConfBridge` meet-me (8001-8009) and chained-transfer
+  `*0NNNN` conference workarounds — superseded by the native
+  Confrn softkey.
+- `*8` group pickup and `*97` voicemail — generic Asterisk
+  features that don't belong in a Cisco-specific sample.
+- Stale "Phase 1: read-only — Mute/Remove softkeys are not yet
+  implemented" comment — implemented in v0.3.0.
+
+169 → 52 lines. No code or runtime change.
+
 ## v0.4.0 — 2026-05-15
 
 Bench-debugged release: every behavioural change here was prompted

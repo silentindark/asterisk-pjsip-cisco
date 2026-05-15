@@ -5,9 +5,7 @@ Maintainer: Andrew Simmonds <simmo@rinseout.org>
 Build-Depends:
  debhelper-compat (= 13),
  asterisk-dev (>= 1:20.0.0),
- pkg-config,
- wget,
- ca-certificates
+ pkg-config
 Standards-Version: 4.6.2
 Homepage: https://github.com/s1mm01/asterisk-pjsip-cisco
 Vcs-Git: https://github.com/s1mm01/asterisk-pjsip-cisco.git
@@ -25,13 +23,25 @@ Description: Cisco Enterprise SIP firmware support for Asterisk chan_pjsip
  channel driver, without patching Asterisk core.
  .
  Provides BLF Speed Dial line-button support, the Cisco RemoteCC
- optionsind/bulkupdate REGISTER flow that the firmware expects, server-
- pushed unsolicited Event: presence NOTIFYs, Cisco-flavoured PIDF body
- generation, DND/CFwdALL softkey handling, and CLI commands for
- service-control NOTIFYs (check-sync / restart / reset). Also adds Cisco
- call signaling headers/SDP quirks and handles initial Cisco RemoteCC REFER
- traffic, including HLog and MCID softkeys, plus Phase 1 conference
- control (read-only ConfList participant list).
+ optionsind/bulkupdate REGISTER flow the firmware expects, server-pushed
+ unsolicited Event: presence NOTIFYs, Cisco-flavoured PIDF body generation
+ (with presence-state-driven BLF lamps for DND), DND / CFwdALL / HuntGroup
+ softkey handling plus matching CLIs and CISCO_*() dialplan functions,
+ CLI service-control NOTIFYs (check-sync / restart / reset / prt-report),
+ and Cisco call signaling headers / SDP quirks.
+ .
+ Handles Cisco RemoteCC REFER traffic including HLog, MCID, Park,
+ ParkMonitor, and Record (StartRecording / StopRecording via MixMonitor)
+ softkeys. Phase 1 conference control: a Confrn-built multimix bridge
+ with phone-side UI promotion (Conference glyph + un-hold), the Join /
+ Select / Unselect multi-call merge, RmLastConf, and the ConfList
+ participant list with its Mute / Remove / Update action softkeys.
+ .
+ NAT-friendly: a global on_tx_request hook rewrites the Request-URI and
+ To-URI back to the phone's self-advertised host:port when Asterisk's
+ rewrite_contact=yes has left an x-ast-orig-host parameter on the
+ Contact-derived RURI, so unsolicited NOTIFYs and REFERs reach Cisco
+ phones behind NAT instead of being rejected with 400 Bad Request.
  .
  Targets phones running Cisco's Enterprise SIP firmware which would
  otherwise need either CallManager or the cisco-usecallmanager chan_sip

@@ -4,7 +4,7 @@
 
 This repository builds out-of-tree Asterisk `res_pjsip_cisco_*` shared modules for Cisco Enterprise SIP firmware support.
 
-- `res/` contains the C modules, shared helper header (`cisco_endpoint.h`), module export files, and generated `.so` build outputs.
+- `res/` contains the C modules, six topical shared-helper headers (`cisco_endpoint.h`, `cisco_rdata.h`, `cisco_register.h`, `cisco_refer.h`, `cisco_session.h`, `cisco_orig_host.h`) with bodies in sibling `cisco_*.c` files compiled into `res_pjsip_cisco_endpoint.so`, per-module export files, and generated `.so` build outputs.
 - `doc/` contains generated Asterisk XML documentation (`res_pjsip_cisco-en_US.xml`).
 - `conf-samples/` contains sample `pjsip.conf` Cisco sections.
 - `debian/` contains Debian packaging metadata and `debian/rules`.
@@ -26,7 +26,11 @@ Use existing Asterisk C style: tabs for indentation, braces on control blocks, `
 
 ## Testing Guidelines
 
-There is no unit-test framework in this repository. CI validates compilation, shared-object generation, XML validity, and Debian package construction. For behavior changes, follow `tests/README.md`: use a parallel PJSIP TCP transport, capture REGISTER/REFER/NOTIFY traffic, and verify BLF/service-control behavior on a real phone. Document tested Asterisk, pjproject, phone model, and firmware version in PRs.
+`make tests` runs two flavours from `tests/unit/`:
+- **smoke** — `xmllint` the generated `doc/res_pjsip_cisco-en_US.xml` plus `readelf`-based symbol checks (`__mod_info`, `load_module`, `unload_module`) for each `.so`. Catches the failure modes that surface as "module silently refuses to register at startup".
+- **unit** — standalone pjlib-linked C programs with `assert()`s. Today covers pjlib primitives (`pj_stricmp2`, `pj_strchr`, `pj_str`) we rely on; pattern in `test_string_utils.c` for adding more. The harness ships stubs for `__ast_repl_malloc` / `__ast_free` so it links without libasterisk.
+
+For behaviour changes that touch live SIP flows, follow `tests/README.md`: parallel PJSIP TCP transport, capture REGISTER/REFER/NOTIFY traffic, verify on a real phone. Document tested Asterisk, pjproject, phone model, and firmware version in PRs.
 
 ## Commit & Pull Request Guidelines
 

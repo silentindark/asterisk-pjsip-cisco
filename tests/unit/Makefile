@@ -1,0 +1,118 @@
+# Unit tests for asterisk-pjsip-cisco. Two flavours:
+#
+#   smoke   — sanity-checks the build artefacts that Asterisk's loader
+#             will actually look at: validates the generated doc XML
+#             with xmllint, and uses readelf to confirm each .so has
+#             the AST_MODULE_INFO descriptor + load/unload symbols at
+#             the offsets the loader expects.
+#
+#   unit    — pjlib-linked C tests for genuinely-pure helpers. Lives
+#             below this Makefile in unit-tests/ ; today it carries
+#             one example (test_string_utils) demonstrating the
+#             pjlib-init pattern, which future tests can copy.
+#
+# Invoke from the repository root via `make tests`, or directly with
+# `make -C tests/unit all` from a checkout.
+
+SHELL := /bin/bash
+
+REPO_ROOT := $(abspath $(CURDIR)/../..)
+
+CC      ?= cc
+# -O0: keep test bodies un-folded so assertions actually evaluate at
+# runtime instead of gcc proving them at compile time and constant-
+# folding the entire test away (which would also make local pj_str_t
+# variables look "unused").
+CFLAGS  ?= -O0 -g
+override CFLAGS += -Wall -Werror -Wstrict-prototypes -Wmissing-prototypes \
+                   -Wshadow -Wpointer-arith
+
+# Pick up pjproject the same way the top-level Makefile does: pkg-config
+# first, PJPROJECT_DIR second.
+PJPROJECT_CFLAGS := $(shell pkg-config --cflags libpjproject 2>/dev/null)
+ifeq ($(strip $(PJPROJECT_CFLAGS)),)
+PJPROJECT_CFLAGS := $(shell pkg-config --cflags pjproject 2>/dev/null)
+endif
+ifeq ($(strip $(PJPROJECT_CFLAGS)),)
+ifneq ($(strip $(PJPROJECT_DIR)),)
+PJPROJECT_CFLAGS := -DPJ_AUTOCONF=1 \
+                    -I$(PJPROJECT_DIR)/third-party/pjproject/source/pjlib/include \
+                    -I$(PJPROJECT_DIR)/third-party/pjproject/source/pjlib-util/include \
+                    -I$(PJPROJECT_DIR)/third-party/pjproject/source/pjnath/include \
+                    -I$(PJPROJECT_DIR)/third-party/pjproject/source/pjmedia/include \
+                    -I$(PJPROJECT_DIR)/third-party/pjproject/source/pjsip/include
+endif
+endif
+
+PJPROJECT_LIBS := $(shell pkg-config --libs libpjproject 2>/dev/null)
+ifeq ($(strip $(PJPROJECT_LIBS)),)
+PJPROJECT_LIBS := $(shell pkg-config --libs pjproject 2>/dev/null)
+endif
+# Fall back to bundled static libs under PJPROJECT_DIR if pkg-config
+# didn't surface a system pjproject — same path the top-level Makefile
+# pulls headers from when building against an Asterisk source tree.
+# Glob picks up whatever <arch> suffix the build used (e.g.
+# x86_64-pc-linux-gnu vs x86_64-unknown-linux-gnu).
+ifeq ($(strip $(PJPROJECT_LIBS)),)
+ifneq ($(strip $(PJPROJECT_DIR)),)
+PJPROJECT_LIBS := \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjsip/lib/libpjsua-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjsip/lib/libpjsip-ua-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjsip/lib/libpjsip-simple-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjsip/lib/libpjsip-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjmedia/lib/libpjmedia-codec-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjmedia/lib/libpjmedia-videodev-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjmedia/lib/libpjmedia-audiodev-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjmedia/lib/libpjmedia-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjnath/lib/libpjnath-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjlib-util/lib/libpjlib-util-*.a) \
+    $(wildcard $(PJPROJECT_DIR)/third-party/pjproject/source/pjlib/lib/libpj-*.a)
+endif
+endif
+
+UNIT_BINS := test_string_utils
+
+# Asterisk's bundled pjproject patches malloc/free to route through
+# __ast_repl_malloc / __ast_free. Stubs link those symbols into the
+# test binary so we don't need libasterisk. libuuid covers
+# pjlib/guid_uuid.c.
+STUB_OBJS  := asterisk_stubs.o
+EXTRA_LIBS := -luuid -lpthread -lm
+
+.PHONY: all smoke unit clean
+
+all: smoke unit
+
+# --------------------------------------------------------------------
+# Smoke target: validates that `make` produced loadable artefacts.
+# Runs xmllint on the generated documentation XML, and uses readelf
+# to verify each .so file has the AST_MODULE_INFO + load_module +
+# unload_module symbols Asterisk's loader expects.
+# --------------------------------------------------------------------
+
+smoke:
+	@$(REPO_ROOT)/tests/unit/smoke.sh
+
+# --------------------------------------------------------------------
+# Unit tests: standalone C programs linked against pjproject. Each test
+# carries its own main() with assert()s. Adding a new test: write
+# test_<name>.c, add the name to UNIT_BINS above, copy the pjlib init
+# pattern from test_string_utils.c.
+# --------------------------------------------------------------------
+
+unit: $(UNIT_BINS)
+	@set -e; for t in $(UNIT_BINS); do \
+	  echo "  RUN  $$t"; \
+	  ./$$t || { echo "  FAIL $$t"; exit 1; }; \
+	done
+	@echo "All $(words $(UNIT_BINS)) unit test(s) passed."
+
+asterisk_stubs.o: asterisk_stubs.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+%: %.c $(STUB_OBJS)
+	$(CC) $(CFLAGS) $(PJPROJECT_CFLAGS) -o $@ $< $(STUB_OBJS) \
+	    $(PJPROJECT_LIBS) $(EXTRA_LIBS)
+
+clean:
+	rm -f $(UNIT_BINS) $(STUB_OBJS)

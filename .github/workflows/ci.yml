@@ -186,6 +186,24 @@ jobs:
           test -f doc/res_pjsip_cisco-en_US.xml
           xmllint --noout doc/res_pjsip_cisco-en_US.xml
 
+      - name: smoke test
+        # tests/unit/smoke.sh xmllints the generated doc XML (already
+        # done above, kept here for consistency) AND uses readelf to
+        # confirm every .so has __mod_info + load_module + unload_module
+        # symbols at the offsets Asterisk's loader resolves via dlsym
+        # at registration. Catches the "module silently refuses to
+        # register at startup" failure mode that previous CI couldn't
+        # see without a running asterisk. binutils (readelf) +
+        # libxml2-utils (xmllint) are already installed in the build-
+        # deps step above.
+        #
+        # The unit-test target under tests/unit/ links against
+        # pjproject static libs, which CI deliberately doesn't build
+        # (we only ./configure pjproject for headers, never make).
+        # Skipping unit here keeps CI's pjproject side header-only;
+        # locally `make tests` exercises both halves.
+        run: bash tests/unit/smoke.sh
+
       - name: package check (Debian)
         env:
           PJPROJECT_INCLUDE: >-

@@ -140,9 +140,17 @@ SOS  := $(addprefix res/,$(addsuffix .so,$(MODULES)))
 
 DOC_XML := doc/res_pjsip_cisco-en_US.xml
 
-.PHONY: all clean install uninstall doc check check-headers help
+.PHONY: all clean install uninstall doc check check-headers help tests
 
 all: check-headers $(SOS) $(DOC_XML)
+
+# --------------------------------------------------------------------
+# Tests: build-artefact smoke checks + pjlib-linked unit tests. See
+# tests/unit/README.md for what's covered and how to add more.
+# --------------------------------------------------------------------
+
+tests: all
+	$(MAKE) -C tests/unit all PJPROJECT_DIR='$(PJPROJECT_DIR)'
 
 # --------------------------------------------------------------------
 # Per-module build rule. AST_MODULE is the C symbol Asterisk uses to

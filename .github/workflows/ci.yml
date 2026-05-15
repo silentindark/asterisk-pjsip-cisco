@@ -143,6 +143,21 @@ jobs:
               -O pjproject.tgz
           tar xzf pjproject.tgz
           mv "pjproject-${VER}" pjproject
+          # Force the K&R -> ANSI declaration fix on pjlib's
+          # pj_thread_unregister. Stock pjproject (both 2.14 shipped
+          # with asterisk 20.x and 2.16 shipped with 22.x/23.x) carries
+          # the K&R form `pj_thread_unregister()` in pj/os.h, which
+          # trips -Wstrict-prototypes under our -Werror build. Asterisk
+          # ships an `0010-pj_thread_unregister_void.patch` in newer
+          # branches (22.x+) to fix this, but 20.x doesn't carry it,
+          # and CI resolves the asterisk tag at runtime so we can't
+          # statically rely on the patch being present. Sed-fixing the
+          # one-line declaration is version-independent and idempotent
+          # (re-running matches nothing); the alternative is dropping
+          # -Wstrict-prototypes from the Makefile, which would weaken
+          # the warning for our own code too.
+          sed -i 's|pj_thread_unregister()|pj_thread_unregister(void)|' \
+              pjproject/pjlib/include/pj/os.h
           # pjproject's config.h #includes <pj/config_site.h> (user-
           # supplied; empty is fine) plus, when PJ_AUTOCONF is set,
           # pj/compat/os_auto.h + m_auto.h which configure generates.

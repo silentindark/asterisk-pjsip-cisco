@@ -889,6 +889,7 @@ typedef enum {
 } peer_cb_result;
 
 typedef peer_cb_result (*peer_state_cb)(
+	struct ast_channel *peer,
 	const struct cisco_h264_imageattr_state *state, void *cb_arg);
 
 static peer_cb_result invoke_cb_on_channel(struct ast_channel *peer,
@@ -899,7 +900,7 @@ static peer_cb_result invoke_cb_on_channel(struct ast_channel *peer,
 
 	ast_channel_lock(peer);
 	ds = ast_channel_datastore_find(peer, &cisco_h264_imageattr_info, NULL);
-	rc = cb(ds ? ds->data : NULL, cb_arg);
+	rc = cb(peer, ds ? ds->data : NULL, cb_arg);
 	ast_channel_unlock(peer);
 	return rc;
 }
@@ -1021,10 +1022,11 @@ static void with_peer_state(struct ast_sip_session *session,
 	ast_channel_unref(local);
 }
 
-static peer_cb_result peer_imageattr_cb(
+static peer_cb_result peer_imageattr_cb(struct ast_channel *peer,
 	const struct cisco_h264_imageattr_state *state, void *cb_arg)
 {
 	char **out = cb_arg;
+	(void) peer;
 
 	if (state && state->value) {
 		*out = ast_strdup(state->value);
@@ -1050,29 +1052,45 @@ static char *cisco_h264_peer_imageattr(struct ast_sip_session *session)
 /*!
  * \brief Accumulator for the had_video lookup. Walked across every
  *        viable peer candidate; the final answer is derived after
- *        the walk completes (any_observed ? any_had_video : -1).
+ *        the walk completes.
+ *
+ *   pjsip_siblings   — count of linkedid-matched (or bridge_peer)
+ *                      channels whose technology is "PJSIP". Helper
+ *                      channels (Local;1/;2, parking, dialplan-app
+ *                      hangers-on) are deliberately not counted —
+ *                      they share linkedid but carry no SDP and
+ *                      therefore can't be a video sink/source.
+ *   any_observed     — at least one PJSIP sibling carried our
+ *                      datastore (i.e. its incoming-SDP capture
+ *                      hook has fired).
+ *   any_had_video    — among the observed PJSIP siblings, at least
+ *                      one offered live video media.
  */
 struct had_video_acc {
+	int pjsip_siblings;
 	int any_observed;
 	int any_had_video;
 };
 
-static peer_cb_result peer_had_video_cb(
+static peer_cb_result peer_had_video_cb(struct ast_channel *peer,
 	const struct cisco_h264_imageattr_state *state, void *cb_arg)
 {
 	struct had_video_acc *acc = cb_arg;
+	const struct ast_channel_tech *tech;
 
+	tech = ast_channel_tech(peer);
+	if (!tech || strcasecmp(tech->type, "PJSIP")) {
+		/* Local channels and other helpers contribute nothing —
+		 * they have no SDP. Don't count them as "a SIP peer". */
+		return PEER_CB_CONTINUE;
+	}
+	++acc->pjsip_siblings;
 	if (state && state->observed) {
 		acc->any_observed = 1;
 		if (state->had_video_media) {
 			acc->any_had_video = 1;
 		}
 	}
-	/* Always continue: helper channels (Local;1/;2, parking) share
-	 * linkedid but carry no datastore — we want to walk past them
-	 * and find the real PJSIP peer's observation. The accumulator
-	 * naturally skips state=NULL candidates without polluting the
-	 * answer. */
 	return PEER_CB_CONTINUE;
 }
 
@@ -1080,21 +1098,35 @@ static peer_cb_result peer_had_video_cb(
  * \brief Did at least one peer leg's most-recent incoming SDP carry
  *        live video media?
  *
- * \retval  1  some peer had video. Don't suppress: there's a real
- *             source to relay.
- * \retval  0  one or more peers observed, NONE had video. Safe to
- *             reject our outgoing video stream.
- * \retval -1  no peer observation at all — either no peer channel
- *             exists yet, every candidate was a helper channel
- *             without our datastore, or the peer leg's incoming
- *             hook hasn't fired. Callers must treat as "leave the
- *             stream alone" (don't suppress on uncertainty).
+ * \retval  1  one or more PJSIP peers observed, at least one had
+ *             video. There's a real source to relay; don't suppress.
+ * \retval  0  EITHER (a) one or more PJSIP peers observed and NONE
+ *             had video (voice-only callee) OR (b) zero PJSIP
+ *             siblings at all (call terminates in dialplan —
+ *             MusicOnHold, VoiceMail, IVR, ConfBridge, etc — no
+ *             video sink exists). Both cases: safe to reject our
+ *             outgoing video stream.
+ * \retval -1  PJSIP siblings exist but none have an SDP observation
+ *             yet (pre-setup window between channel creation and
+ *             the dial leg's incoming hook firing). Caller must
+ *             treat as "leave the stream alone" — suppressing here
+ *             would race the late observation and misfire.
  */
 static int cisco_h264_peer_had_video(struct ast_sip_session *session)
 {
-	struct had_video_acc acc = { 0, 0 };
+	struct had_video_acc acc = { 0, 0, 0 };
 
 	with_peer_state(session, peer_had_video_cb, &acc);
+
+	if (acc.pjsip_siblings == 0) {
+		/* No SIP peer leg in this call. Asterisk is the
+		 * terminator — MusicOnHold / VoiceMail / IVR / etc —
+		 * and there's no video to relay either way. Suppress
+		 * the phantom outgoing-answer video so the caller's
+		 * receive pane doesn't paint black waiting for frames
+		 * that nothing will ever generate. */
+		return 0;
+	}
 	if (!acc.any_observed) {
 		return -1;
 	}

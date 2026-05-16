@@ -1,3 +1,19 @@
+asterisk-pjsip-cisco (0.4.2-1) unstable; urgency=medium
+
+  * Phantom video suppression now also fires when the call
+    terminates in Asterisk (MusicOnHold, VoiceMail, IVR,
+    ConfBridge meet-me, dialplan apps). v0.4.0 covered the
+    video-phone -> voice-only-SIP-endpoint case but missed the
+    "no second SIP leg at all" case, leaving black video panes
+    on calls to e.g. *97 voicemail or hold-music extensions.
+    Fixed by counting only PJSIP-tech siblings in the linkedid
+    walk and treating zero PJSIP siblings as "no video sink ->
+    suppress".
+  * Bench-verified on Asterisk 22.9 against CP-8865 dialing
+    MusicOnHold and SayUnixTime extensions.
+
+ -- Andrew Simmonds <simmo@rinseout.org>  Sat, 16 May 2026 12:00:00 +0800
+
 asterisk-pjsip-cisco (0.4.1-1) unstable; urgency=medium
 
   * Docs-only: trim conf-samples/extensions.conf.cisco-features.sample

@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.4.2 — 2026-05-16
+
+Bug fix follow-up to v0.4.0's phantom-video-suppression work.
+v0.4.0 covered the case where a video phone dials a voice-only
+SIP endpoint (`6012 -> 6003 with no h264`); it missed the
+adjacent case where Asterisk itself terminates the call —
+MusicOnHold, VoiceMail, IVR / SayUnixTime applications,
+ConfBridge meet-mes, anything that runs in dialplan without a
+second SIP leg. Symptom: black video pane on the 8865 for the
+duration of the playback, because the linkedid walk found zero
+SIP siblings, `cisco_h264_peer_had_video` returned `-1`
+("unknown — leave alone"), and the phantom `m=video <port> sendonly`
+shipped to the caller.
+
+Distinguish "no SIP peer at all" from "SIP peer exists but no
+SDP yet". The per-candidate accumulator now counts only
+candidates whose channel tech is `"PJSIP"` — Local/parking/
+dialplan-app helpers share linkedid but contribute no SDP and
+thus no video sink. Three outcomes:
+
+- **`pjsip_siblings == 0`** → suppress. Asterisk is running a
+  dialplan app on this chan_pjsip channel itself; no video sink
+  exists.
+- **`pjsip_siblings > 0`, none observed yet** → leave alone
+  (pre-setup window; suppressing would race the late observation).
+- **At least one observed** → use the aggregated `any_had_video`
+  flag (unchanged from v0.4.0).
+
+Bench-verified: video phone (CP-8865 at 6003) dialed `6666`
+(MusicOnHold) and `1234` (Answer + SayUnixTime). Both 200 OK
+responses back to 6003 carry `m=video 0`; the video pane closes
+immediately instead of hanging. The previously-tested video ↔
+voice-only path still suppresses correctly because the dial-leg
+sibling is counted (`pjsip_siblings == 1`) and its observed
+`had_video_media == 0`.
+
 ## v0.4.1 — 2026-05-15
 
 Docs-only patch. The shipped

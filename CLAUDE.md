@@ -9,9 +9,10 @@ Ten out-of-tree Asterisk shared modules (`res_pjsip_cisco_*`) that bolt Cisco En
 ## Build & development commands
 
 ```sh
-make                      # build all .so + regen doc/res_pjsip_cisco-en_US.xml
-make clean
-sudo make install         # to ASTERISK_MODULES_DIR / ASTERISK_DOC_DIR / ASTERISK_SAMPLE_DIR
+make                      # build all .so into $(OBJ_DIR) + regen $(DOC_XML)
+make doc                  # regenerate only the XML documentation
+make clean                # rm -rf $(OBJ_DIR)/
+sudo make install         # built .so -> ASTERISK_MODULES_DIR, $(DOC_XML) -> ASTERISK_DOC_DIR, conf-samples -> ASTERISK_SAMPLE_DIR
 sudo make uninstall
 sudo make check           # runtime: queries a running asterisk for "module show like cisco_"
 dpkg-buildpackage -us -uc -b -d   # Debian packaging (-d skips Build-Depends not on stock Ubuntu)
@@ -24,6 +25,7 @@ Header sourcing — pick **one** of these when invoking `make`:
 - Bare `make` — uses `pkg-config libpjproject` and asterisk-dev. Only safe when both are in lockstep with the running asterisk binary.
 
 The `check-headers` target is a sanity gate; it fails fast if neither path resolves.
+`OBJ_DIR` defaults to `obj`; `MODULE_BUILD_DIR` and `DOC_XML` derive from it unless explicitly overridden.
 
 There is **no unit-test framework**. CI (`.github/workflows/ci.yml`) builds against the highest stable tags of Asterisk 20.x (the LTS before 22), 22.x, and 23.x — downloads matching pjproject (version pinned from `asterisk-src/third-party/versions.mak`), stubs `buildopts.h`, and verifies all ten `.so` files plus XML validity. Behaviour is verified by hand against a real Cisco phone (on 22.9.x) — see `tests/README.md` for the parallel-TCP-on-:5160 recipe.
 
@@ -44,23 +46,23 @@ Missing any of (2)–(4) silently downgrades the buttons. The module set supplie
 
 ### The gating contract
 
-Existence of a `[name] type=cisco` sorcery section (defined by `res_pjsip_cisco_endpoint`, schema in `res/cisco_endpoint.h`) is the **single gating signal** for every Cisco-specific behaviour in the other modules. A non-Cisco endpoint with no parallel `type=cisco` section falls through every supplement/hook unchanged. The PIDF body generator (`res_pjsip_cisco_pidf_body_generator`) is the deliberate exception — it's global and emits Cisco-flavoured PIDF for any presence subscriber, since non-Cisco UAs ignore the extra RPID elements.
+Existence of a `[name] type=cisco` sorcery section (defined by `res_pjsip_cisco_endpoint`, schema in `include/cisco/endpoint.h`) is the **single gating signal** for every Cisco-specific behaviour in the other modules. A non-Cisco endpoint with no parallel `type=cisco` section falls through every supplement/hook unchanged. The PIDF body generator (`res_pjsip_cisco_pidf_body_generator`) is the deliberate exception — it's global and emits Cisco-flavoured PIDF for any presence subscriber, since non-Cisco UAs ignore the extra RPID elements.
 
 ### Shared helpers live in `res_pjsip_cisco_endpoint.so`
 
 Same pattern stock Asterisk uses for `ast_sip_*` (defined in `res_pjsip.so`, called from every PJSIP submodule):
 
-- The six topical headers under `res/` — `cisco_endpoint.h`, `cisco_rdata.h`, `cisco_register.h`, `cisco_refer.h`, `cisco_session.h`, `cisco_orig_host.h` — contain **declarations only** (struct definitions, typedefs, function prototypes).
-- The bodies live in sibling `.c` files (`res/cisco_endpoint.c`, `cisco_rdata.c`, `cisco_register.c`, `cisco_refer.c`, `cisco_session.c`, `cisco_orig_host.c`) which **compile into `res_pjsip_cisco_endpoint.so`** alongside the module entry point.
+- The six topical headers under `include/cisco/` — `endpoint.h`, `rdata.h`, `register.h`, `refer.h`, `session.h`, `orig_host.h` — contain **declarations only** (struct definitions, typedefs, function prototypes). Consumers `#include "cisco/<topic>.h"` (with `-Iinclude`).
+- The bodies live in sibling `.c` files under `res/cisco_endpoint/` (`endpoint.c`, `rdata.c`, `register.c`, `refer.c`, `session.c`, `orig_host.c`) which **compile into `res_pjsip_cisco_endpoint.so`** alongside the module entry point `res/res_pjsip_cisco_endpoint.c`.
 - `res_pjsip_cisco_endpoint.c`'s `AST_MODULE_INFO` carries `AST_MODFLAG_GLOBAL_SYMBOLS` so Asterisk's loader (which defaults to `RTLD_LOCAL`) re-opens the module with `RTLD_GLOBAL` and makes its symbols visible to subsequent `dlopen`s.
-- `res/res_pjsip_cisco_endpoint.exports` lists `cisco_*` as `global:`. Every other module's `.exports` has `local: *;` only. The Makefile passes `-Wl,--version-script=res/<module>.exports` for every `.so`, so the export set is enforced.
+- `res/res_pjsip_cisco_endpoint.exports` lists `cisco_*` as `global:`. Every other module's `.exports` has `local: *;` only. The Makefile passes `-Wl,--version-script=res/res_pjsip_cisco_<module>.exports` for every `.so`, so the export set is enforced.
 - Module load order is governed by each consumer's `AST_MODULE_INFO.requires` field — they list `res_pjsip_cisco_endpoint`, which guarantees the helpers are resolvable by the time a consumer loads.
 
-To add a new shared helper: declare it in the topical `.h`, define it in the sibling `.c`. It picks up the `cisco_*` export glob automatically. No need to touch `.exports` unless the helper name doesn't start with `cisco_`.
+To add a new shared helper: declare it in the topical `.h` under `include/cisco/`, define it in the sibling `.c` under `res/cisco_endpoint/`. It picks up the `cisco_*` export glob automatically. No need to touch `.exports` unless the helper name doesn't start with `cisco_`.
 
-The grouping into topical headers (rather than one big shared `.h`) is for readability — split by concern: endpoint state, REGISTER tracking, REFER sending, rdata/URI/XML utilities, session/dialog lookup. Cross-cisco header dependencies are: `rdata.h` → `endpoint.h`; `register.h` → `rdata.h` (transitively `endpoint.h`); `refer.h`, `session.h`, and `orig_host.h` are independent.
+The grouping into topical headers (rather than one big shared `.h`) is for readability — split by concern: endpoint state, REGISTER tracking, REFER sending, rdata/URI/XML utilities, session/dialog lookup. Cross-cisco header dependencies are: `cisco/rdata.h` → `cisco/endpoint.h`; `cisco/register.h` → `cisco/rdata.h` (transitively `cisco/endpoint.h`); `cisco/refer.h`, `cisco/session.h`, and `cisco/orig_host.h` are independent.
 
-**`cisco_orig_host` is a different shape** to the others: it's not a function library that other modules call, it's an `on_tx_request` `pjsip_module` that `res_pjsip_cisco_endpoint`'s `load_module` registers globally. Every outbound SIP request from any consumer module (or stock asterisk) passes through it; the hook rewrites the Request-URI and To-URI back to the phone's self-advertised host:port when `res_pjsip_nat`'s `rewrite_contact=yes` has left an `x-ast-orig-host` URI parameter on the Contact-derived RURI. Without this, Cisco firmware on NAT'd phones rejects unsolicited NOTIFYs/REFERs with `400 Bad Request` because the public NAT mapping in the RURI doesn't match what the phone knows about itself. A strict no-op for any URI lacking the parameter (LAN-registered contacts, upstream trunks, non-NAT'd targets) — consumers don't opt in, the hook just runs.
+**`orig_host` is a different shape** to the others: it's not a function library that other modules call, it's an `on_tx_request` `pjsip_module` that `res_pjsip_cisco_endpoint`'s `load_module` registers globally. Every outbound SIP request from any consumer module (or stock asterisk) passes through it; the hook rewrites the Request-URI and To-URI back to the phone's self-advertised host:port when `res_pjsip_nat`'s `rewrite_contact=yes` has left an `x-ast-orig-host` URI parameter on the Contact-derived RURI. Without this, Cisco firmware on NAT'd phones rejects unsolicited NOTIFYs/REFERs with `400 Bad Request` because the public NAT mapping in the RURI doesn't match what the phone knows about itself. A strict no-op for any URI lacking the parameter (LAN-registered contacts, upstream trunks, non-NAT'd targets) — consumers don't opt in, the hook just runs.
 
 ### Module loading & PIDF body-generator slot
 
@@ -70,7 +72,7 @@ The grouping into topical headers (rather than one big shared `.h`) is for reada
 
 ### XML documentation
 
-Asterisk's strict sorcery validator demands a matching `<configObject>` in some XML file under `$ASTERISK_DOC_DIR` before it will accept field registrations. The Makefile harvests every `/*** DOCUMENTATION ... ***/` block from `res/*.c`, concatenates them into `doc/res_pjsip_cisco-en_US.xml`, and `make install` deploys it. **When you add or rename a sorcery field, the matching `<configOption>` block in the source file is mandatory** — Asterisk will refuse to load the module otherwise.
+Asterisk's strict sorcery validator demands a matching `<configObject>` in some XML file under `$ASTERISK_DOC_DIR` before it will accept field registrations. The Makefile harvests every `/*** DOCUMENTATION ... ***/` block from `res/*.c` and `res/cisco_*/*.c`, concatenates them into `$(DOC_XML)` (`obj/doc/res_pjsip_cisco-en_US.xml` by default), and `make install` deploys it. **When you add or rename a sorcery field, the matching `<configOption>` block in the source file is mandatory** — Asterisk will refuse to load the module otherwise.
 
 ### Hook style for REGISTER-driven behaviour
 

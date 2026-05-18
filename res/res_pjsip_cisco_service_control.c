@@ -3,8 +3,17 @@
  *
  * res_pjsip_cisco_service_control
  *
- * CLI commands that send Cisco-flavoured service-control NOTIFYs to a
- * registered Cisco Enterprise SIP firmware phone:
+ * Operator CLI for a registered Cisco Enterprise SIP firmware phone:
+ * service-control NOTIFYs (check-sync / restart / reset / prt-report)
+ * plus a read-only status diagnostic.
+ *
+ *   pjsip cisco status <endpoint>
+ *      Read-only dump of the cisco sorcery config + registered
+ *      contacts (URI / User-Agent / Via / expiry) + MWI counts
+ *      bulkupdate would send + astdb feature state (DND / HuntGroup
+ *      / CF). The shape you want when debugging "why don't the BLF
+ *      lamps light" or "why doesn't DND register on the phone" or
+ *      "why is the MWI lamp wrong".
  *
  *   pjsip cisco check-sync <endpoint> [contact]
  *      Event: check-sync, Subscription-State: terminated, no body.
@@ -38,7 +47,7 @@
  * which were driven from sip_notify.conf templates.
  *
  * Gating: only operates on endpoints that have a [name] type=cisco
- * section (per Phase 1 sorcery in res_pjsip_cisco_endpoint).
+ * sorcery section (defined by res_pjsip_cisco_endpoint).
  *
  * RegisterCallId: the chan_sip patch's restart/reset bodies include
  *   RegisterCallId={<call-id from last REGISTER>}
@@ -70,12 +79,14 @@
 #include "asterisk/module.h"
 #include "asterisk/strings.h"
 #include "asterisk/utils.h"
+#include "asterisk/time.h"
 #include "asterisk/cli.h"
+#include "asterisk/astobj2.h"
 #include "asterisk/res_pjsip.h"
 #include "asterisk/sorcery.h"
 
-#include "cisco_endpoint.h"
-#include "cisco_rdata.h"
+#include "cisco/endpoint.h"
+#include "cisco/rdata.h"
 
 enum sc_action {
 	SC_CHECK_SYNC,
@@ -501,7 +512,205 @@ static char *cli_cisco_prt_report(struct ast_cli_entry *e, int cmd,
 	return cli_cisco_run(a, SC_PRT_REPORT);
 }
 
+/*!
+ * \brief `pjsip cisco status <endpoint>`. Read-only diagnostic dump:
+ *        cisco sorcery config + registered contacts (URI, User-Agent,
+ *        Via source, expiry) + astdb feature state (DND / HuntGroup /
+ *        CF). The shape an operator wants when debugging "why don't
+ *        the BLF lamps light?" / "why isn't the DND softkey doing
+ *        anything?" / "is the phone behind NAT showing the right Via?".
+ *
+ * Nothing is mutated. Output is human-readable, mirroring
+ * `pjsip show endpoint X`'s style. Stops short of cross-`.so` private
+ * state (bulkupdate's address-change cache, feature_events' MAC map);
+ * those would need cisco_* exports that don't exist today and aren't
+ * worth adding just for this CLI.
+ */
+static char *cli_cisco_status(struct ast_cli_entry *e, int cmd,
+	struct ast_cli_args *a)
+{
+	struct ast_sip_endpoint *endpoint;
+	struct cisco_endpoint *cisco;
+	struct ao2_container *contacts = NULL;
+	char cfwd_target[64];
+	int contact_count = 0;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjsip cisco status";
+		e->usage =
+			"Usage: pjsip cisco status <endpoint>\n"
+			"   Show config, registration, and astdb feature state for\n"
+			"   <endpoint>. Read-only — nothing is changed. Useful when\n"
+			"   debugging BLF lamps, DND, hunt-group, or call-forward\n"
+			"   behaviour, or when checking the User-Agent / Via that the\n"
+			"   phone last REGISTERed with.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return a->pos == 3 ? complete_cisco_endpoint(a->word, a->n) : NULL;
+	}
+
+	if (a->argc != 4) {
+		return CLI_SHOWUSAGE;
+	}
+
+	endpoint = ast_sorcery_retrieve_by_id(ast_sip_get_sorcery(),
+		"endpoint", a->argv[3]);
+	cisco = cisco_endpoint_get(a->argv[3]);
+
+	ast_cli(a->fd, "Endpoint: %s\n", a->argv[3]);
+	ast_cli(a->fd, "  type=endpoint section:    %s\n",
+		endpoint ? "yes" : "no");
+	ast_cli(a->fd, "  type=cisco section:       %s\n", cisco ? "yes" : "no");
+
+	if (!cisco) {
+		ast_cli(a->fd, "\n(no [type=cisco] section — endpoint is not "
+			"managed by this package; use 'pjsip show endpoint %s' for "
+			"stock diagnostics)\n", a->argv[3]);
+		ao2_cleanup(endpoint);
+		return CLI_SUCCESS;
+	}
+
+	ast_cli(a->fd, "\n[type=cisco] config:\n");
+	ast_cli(a->fd, "  line_index:               %d\n", cisco->line_index);
+	ast_cli(a->fd, "  subscribe:                %s\n",
+		S_OR(cisco->subscribe, "(none)"));
+	ast_cli(a->fd, "  subscribe_context:        %s\n",
+		S_OR(cisco->subscribe_context, "(default: local_sip_phone)"));
+	ast_cli(a->fd, "  aliases:                  %s\n",
+		S_OR(cisco->aliases, "(none)"));
+	ast_cli(a->fd, "  dnd_busy:                 %s\n",
+		cisco->dnd_busy ? "callreject" : "ringeroff");
+	ast_cli(a->fd, "  parkext:                  %s\n",
+		S_OR(cisco->parkext, "700"));
+	ast_cli(a->fd, "  keep_conference:          %s\n",
+		cisco->keep_conference ? "yes" : "no");
+	ao2_cleanup(cisco);
+
+	ast_cli(a->fd, "\nRegistration:\n");
+	if (endpoint && !ast_strlen_zero(endpoint->aors)) {
+		contacts = ast_sip_location_retrieve_contacts_from_aor_list(
+			endpoint->aors);
+	}
+	if (!contacts || !ao2_container_count(contacts)) {
+		if (!endpoint) {
+			ast_cli(a->fd, "  (no [type=endpoint] section — config drift; "
+				"phone can't register)\n");
+		} else if (ast_strlen_zero(endpoint->aors)) {
+			ast_cli(a->fd, "  (endpoint has no AORs configured)\n");
+		} else {
+			ast_cli(a->fd, "  (no registered contacts)\n");
+		}
+	} else {
+		struct ao2_iterator iter;
+		struct ast_sip_contact *contact;
+
+		iter = ao2_iterator_init(contacts, 0);
+		while ((contact = ao2_iterator_next(&iter))) {
+			struct timeval now = ast_tvnow();
+			int64_t expires_ms = ast_tvdiff_ms(contact->expiration_time, now);
+
+			++contact_count;
+			ast_cli(a->fd, "  Contact #%d:\n", contact_count);
+			ast_cli(a->fd, "    URI:        %s\n", contact->uri);
+			ast_cli(a->fd, "    User-Agent: %s\n",
+				S_OR(contact->user_agent, "(unknown)"));
+			ast_cli(a->fd, "    Via:        %s:%d\n",
+				S_OR(contact->via_addr, "(unknown)"), contact->via_port);
+			ast_cli(a->fd, "    REGISTER Call-ID: %s\n",
+				S_OR(contact->call_id, "(unknown)"));
+			if (expires_ms > 0) {
+				ast_cli(a->fd, "    Expires in: %lld seconds\n",
+					(long long) (expires_ms / 1000));
+			} else {
+				ast_cli(a->fd,
+					"    Expires in: (expired %lld seconds ago)\n",
+					(long long) (-expires_ms / 1000));
+			}
+			ao2_cleanup(contact);
+		}
+		ao2_iterator_destroy(&iter);
+	}
+	ao2_cleanup(contacts);
+
+	/* Cisco device facts — what we learned from REGISTER (Contact
+	 * +sip.instance for MAC + src_host; Reason header for device_name /
+	 * active_load / inactive_load when the phone is configured for
+	 * cisco-usecallmanager-style Reason reporting). Mirrors the per-peer
+	 * fields the chan_sip patch exposes via 'sip show peer'. */
+	{
+		struct cisco_mac_info dev;
+
+		ast_cli(a->fd, "\nCisco device (from REGISTER):\n");
+		if (cisco_mac_lookup_by_endpoint(a->argv[3], &dev)) {
+			ast_cli(a->fd,
+				"  (no entry — endpoint hasn't REGISTERed since module "
+				"load, or its Contact carried no +sip.instance MAC)\n");
+		} else {
+			if (strcmp(dev.endpoint_id, a->argv[3])) {
+				/* Multi-line phone: the queried endpoint is the primary
+				 * (the one with aliases=), but a sibling line registered
+				 * most recently and won the MAC-keyed slot. The device
+				 * facts (MAC, firmware) still apply — same physical
+				 * phone — but flag the indirection so the operator knows. */
+				ast_cli(a->fd,
+					"  (matched via alias '%s' — same physical phone)\n",
+					dev.endpoint_id);
+			}
+			ast_cli(a->fd, "  MAC:                      %s\n", dev.mac);
+			ast_cli(a->fd, "  Source host:              %s\n", dev.src_host);
+			ast_cli(a->fd, "  Device name:              %s\n",
+				S_OR(dev.device_name, "(no Reason header)"));
+			ast_cli(a->fd, "  Active firmware load:     %s\n",
+				S_OR(dev.active_load, "(no Reason header)"));
+			ast_cli(a->fd, "  Inactive firmware load:   %s\n",
+				S_OR(dev.inactive_load, "(no Reason header)"));
+		}
+	}
+
+	/* MWI counts — what bulkupdate puts in <emwi>. Resolution shares
+	 * cisco_endpoint_mwi_count() with bulkupdate's body builder, so the
+	 * counts reported here match exactly what the next REGISTER 200 OK
+	 * will trigger on the wire. NULL endpoint = both zero (no entry,
+	 * no panic). */
+	{
+		int mwi_new, mwi_old;
+
+		cisco_endpoint_mwi_count(endpoint, &mwi_new, &mwi_old);
+		ast_cli(a->fd, "\nMWI:\n");
+		ast_cli(a->fd, "  new:                      %d\n", mwi_new);
+		ast_cli(a->fd, "  old:                      %d\n", mwi_old);
+	}
+
+	ao2_cleanup(endpoint);
+
+	{
+		/* astdb keys carry the endpoint id, so column alignment needs
+		 * the full key built first and padded as a single field —
+		 * matches the value column the [type=cisco] config block above
+		 * lands in. */
+		char dnd_key[128], hg_key[128], cf_key[128];
+
+		snprintf(dnd_key, sizeof(dnd_key), "DND/%s:", a->argv[3]);
+		snprintf(hg_key,  sizeof(hg_key),  "HuntGroup/%s:", a->argv[3]);
+		snprintf(cf_key,  sizeof(cf_key),  "CF/%s:", a->argv[3]);
+
+		cisco_cfwd_get(a->argv[3], cfwd_target, sizeof(cfwd_target));
+
+		ast_cli(a->fd, "\nFeature state (astdb):\n");
+		ast_cli(a->fd, "  %-24s  %s\n", dnd_key,
+			cisco_dnd_is_enabled(a->argv[3]) ? "ON" : "off");
+		ast_cli(a->fd, "  %-24s  %s\n", hg_key,
+			cisco_huntgroup_is_in(a->argv[3]) ? "logged-in" : "logged-out");
+		ast_cli(a->fd, "  %-24s  %s\n", cf_key,
+			ast_strlen_zero(cfwd_target) ? "off" : cfwd_target);
+	}
+
+	return CLI_SUCCESS;
+}
+
 static struct ast_cli_entry cli_cisco_cmds[] = {
+	AST_CLI_DEFINE(cli_cisco_status,     "Show Cisco endpoint config, registration, and feature state"),
 	AST_CLI_DEFINE(cli_cisco_check_sync, "Send Cisco check-sync NOTIFY"),
 	AST_CLI_DEFINE(cli_cisco_restart,    "Send Cisco service-control restart NOTIFY"),
 	AST_CLI_DEFINE(cli_cisco_reset,      "Send Cisco service-control reset NOTIFY"),
@@ -521,7 +730,7 @@ static int unload_module(void)
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER,
-	"PJSIP Cisco service-control CLI commands",
+	"PJSIP Cisco service-control + status CLI commands",
 	.support_level = AST_MODULE_SUPPORT_EXTENDED,
 	.load = load_module,
 	.unload = unload_module,

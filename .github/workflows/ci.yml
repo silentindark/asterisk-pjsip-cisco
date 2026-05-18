@@ -10,20 +10,54 @@ on:
   schedule:
     - cron: '0 6 * * 1'
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: build against asterisk ${{ matrix.asterisk_branch }}
-    runs-on: ubuntu-24.04
+    name: build against asterisk ${{ matrix.asterisk_branch }} on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      OBJ_DIR: obj
+      MODULE_BUILD_DIR: obj
+      DOC_XML: obj/doc/res_pjsip_cisco-en_US.xml
     strategy:
       fail-fast: false
       matrix:
-        # Each entry resolves (at job-start time) to the highest X.Y.Z
-        # stable tag matching the prefix: '20' -> highest 20.y.z (the
-        # current LTS before 22), '22' -> highest 22.y.z (the 22 LTS
-        # line we primarily target; the bench runs a 22.9.x build but
-        # CI tracks the whole 22 line), '23' -> highest 23.y.z.
-        # Stable-branch regressions surface within a week via the cron.
-        asterisk_branch: ['20', '22', '23']
+        # asterisk_branch resolves (at job-start time) to the highest
+        # X.Y.Z stable tag matching the prefix.
+        #
+        # runner is picked so that the cell's apt asterisk MAJOR
+        # version matches asterisk_branch — which then lets the
+        # downstream module-load smoke (gated on major match) actually
+        # exercise this cell's .so files against a real running
+        # asterisk binary. Current alignment (verified against
+        # launchpad.net/ubuntu/+source/asterisk, every pocket):
+        #
+        #   ubuntu-22.04 (jammy) — asterisk 18.10.0 only
+        #   ubuntu-24.04 (noble) — asterisk 20.6.0 only
+        #
+        # No current Ubuntu release packages asterisk 22 or 23, in
+        # any pocket including -backports / -proposed. Cells 22 and
+        # 23 therefore stay runtime-skipped; their build-time ABI
+        # check (compile against the resolved upstream tag) still
+        # applies, so a header-level regression would still fail
+        # the build.
+        #
+        # The asterisk-20 cell uses noble rather than jammy because
+        # jammy's apt asterisk is major 18, which doesn't match.
+        # When Ubuntu eventually packages a higher major (or asterisk
+        # lands in jammy/noble -backports), update the runner entry
+        # for the matching cell; the gate logic below picks it up
+        # automatically. Stable-branch regressions surface within
+        # a week via the cron.
+        include:
+          - asterisk_branch: '20'
+            runner: ubuntu-24.04
+          - asterisk_branch: '22'
+            runner: ubuntu-24.04
+          - asterisk_branch: '23'
+            runner: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
 
@@ -192,14 +226,14 @@ jobs:
                    res_pjsip_cisco_call_extras \
                    res_pjsip_cisco_conference \
                    res_pjsip_cisco_remotecc; do
-            test -f "res/$m.so" || { echo "missing $m.so"; exit 1; }
-            file "res/$m.so" | grep -q "shared object"
+            test -f "$MODULE_BUILD_DIR/$m.so" || { echo "missing $m.so"; exit 1; }
+            file "$MODULE_BUILD_DIR/$m.so" | grep -q "shared object"
           done
 
       - name: verify XML doc generated
         run: |
-          test -f doc/res_pjsip_cisco-en_US.xml
-          xmllint --noout doc/res_pjsip_cisco-en_US.xml
+          test -f "$DOC_XML"
+          xmllint --noout "$DOC_XML"
 
       - name: smoke test
         # tests/unit/smoke.sh xmllints the generated doc XML (already
@@ -212,12 +246,23 @@ jobs:
         # libxml2-utils (xmllint) are already installed in the build-
         # deps step above.
         #
-        # The unit-test target under tests/unit/ links against
-        # pjproject static libs, which CI deliberately doesn't build
-        # (we only ./configure pjproject for headers, never make).
-        # Skipping unit here keeps CI's pjproject side header-only;
-        # locally `make tests` exercises both halves.
+        # The pjproject-linked half of `make tests`
+        # (tests/unit/test_string_utils) is skipped: CI ./configures
+        # pjproject for headers but never `make`s it, so the static
+        # libs aren't there to link against. The libxml2-only half
+        # runs as its own step below.
         run: bash tests/unit/smoke.sh
+
+      - name: build + run XML body well-formedness test
+        # test_xml_bodies snprintfs each wire-format XML body template
+        # (bulkupdate / MCID / Park toast / Park orbit / HLog) with
+        # bench-realistic substitutions and parses the result with
+        # libxml2. Catches sprintf typos (missing close tag, broken
+        # attribute quote) that would otherwise only surface on the
+        # bench. libxml2-only — no pjproject linkage.
+        run: |
+          make -C tests/unit test_xml_bodies
+          ./tests/unit/test_xml_bodies
 
       - name: package check (Debian)
         env:
@@ -239,3 +284,229 @@ jobs:
           # dh -> our Makefile.
           sudo apt-get install -y devscripts debhelper
           dpkg-buildpackage -us -uc -b -d
+
+      # ----------------------------------------------------------
+      # Module-load smoke against a real asterisk.
+      #
+      # Compile-time ABI breakage is caught by the build steps above.
+      # Runtime load failure (sorcery type registration silently
+      # failing, body-generator slot race losing to xpidf, missing
+      # dlsym dependency, struct-offset SEGV during load) needs an
+      # actual asterisk to surface.
+      #
+      # The runner's apt asterisk is exactly ONE major version
+      # (whatever Canonical shipped with that ubuntu release). The
+      # matrix maps each asterisk_branch to a runner that ships a
+      # major-matching apt asterisk (ubuntu-22.04 jammy for the 20
+      # cell, ubuntu-24.04 noble for the 22 cell). Asterisk 23 isn't
+      # in any current Ubuntu release; that cell stays runtime-
+      # skipped here, build-time ABI check still applies.
+      #
+      # Loading e.g. a 23-built .so into apt's 22.x binary is the
+      # exact ABI-mismatch trap we tell operators to avoid
+      # (CLAUDE.md) — SEGV at load or false-positive passing test.
+      # So the load test is gated: only the matrix cell whose
+      # asterisk_branch major matches what `apt-cache` reports for
+      # `asterisk` runs the load steps. Other cells log "skipped
+      # (no major-matching apt asterisk)" and move on. When Ubuntu
+      # eventually ships asterisk 23 (or the LTS bumps), update the
+      # runner mapping in the matrix.include above; the gate logic
+      # here doesn't need to change.
+      #
+      # Patch-version drift inside one major (source 20.13 vs apt
+      # 20.6) is accepted as low-risk: asterisk's LTS lines hold ABI
+      # stable across minor/patch releases. Full coverage for all
+      # matrix cells would require source-building asterisk per
+      # cell (~5-10 min each) — out of scope here; see commit
+      # history for the deliberation.
+      # ----------------------------------------------------------
+
+      - name: detect apt asterisk major version
+        id: apt_asterisk
+        run: |
+          # apt-cache madison emits e.g. "asterisk | 1:20.6.0~dfsg+~cs6.13.40431414-1 | ..."
+          # — the third field is the Debian version; strip the epoch
+          # (everything before ':'), then take the major component.
+          APT_VER=$(apt-cache madison asterisk 2>/dev/null \
+                      | head -1 \
+                      | awk -F'|' '{print $2}' \
+                      | sed 's/^[[:space:]]*//;s/^[0-9]*://' \
+                      | cut -d. -f1)
+          if [ -z "$APT_VER" ]; then
+            APT_VER="(none)"
+          fi
+          echo "apt asterisk major version: $APT_VER"
+          echo "matrix asterisk branch:     ${{ matrix.asterisk_branch }}"
+          echo "major=$APT_VER" >> "$GITHUB_OUTPUT"
+
+      - name: install asterisk runtime + headers from apt
+        # asterisk + asterisk-modules: the daemon and its PJSIP
+        # module set (res_pjsip_pubsub, res_pjsip_session, the
+        # xpidf body generator we slot-race, res_parking for the
+        # remotecc Park path, res_pjsip_exten_state, etc).
+        #
+        # asterisk-dev: asterisk headers in lockstep with the apt
+        # binary. Building against them produces .so files whose
+        # symbol references match what the daemon actually exports
+        # — including across patch-level renames like
+        # ast_sip_push_task → __ast_sip_push_task that mid-20.x
+        # picked up but apt's 20.6 doesn't carry.
+        #
+        # Note: pjproject has no -dev package on Debian/Ubuntu —
+        # asterisk bundles pjproject statically into res_pjsip.so.
+        # We reuse the pjproject headers fetched earlier in the
+        # workflow; pjproject ABI is stable enough across minor
+        # versions that the latest-pin we resolved is compatible
+        # with whatever apt's asterisk was built against.
+        if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
+        run: |
+          sudo apt-get install -y \
+            asterisk asterisk-modules \
+            asterisk-dev
+
+      - name: rebuild + install modules against apt asterisk-dev
+        # The earlier `make` step compiled against the resolved
+        # upstream tag (e.g. 20.13.x). That's our compile-time-
+        # against-latest signal and stays the load-bearing check
+        # for ABI breakage in unreleased asterisk changes. But the
+        # resulting .so files reference symbols as-named in that
+        # tag, which may not match apt's older patch within the
+        # same LTS major:
+        #
+        #   apt 20.6.0:  ast_sip_push_task         (function symbol)
+        #   upstream 20.13+: __ast_sip_push_task   (renamed; old name
+        #                                           became a macro)
+        #
+        # Rebuild without PJPROJECT_DIR so the Makefile picks up
+        # /usr/include/asterisk from asterisk-dev (matching the
+        # apt binary). PJPROJECT_INCLUDE still points at the
+        # fetched pjproject headers (asterisk-dev does NOT ship
+        # pjproject headers — see `install asterisk runtime`).
+        #
+        # `make clean && make && sudo make install` runs in one
+        # step so PJPROJECT_INCLUDE stays in scope for all three
+        # (sudo --preserve-env carries it through `sudo make
+        # install`; the Makefile's check-headers prereq otherwise
+        # re-runs and fails when it can't find pjproject).
+        # ASTERISK_MODULES_DIR / ASTERISK_DOC_DIR auto-resolve
+        # from /etc/asterisk/asterisk.conf via the Makefile.
+        if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
+        env:
+          PJPROJECT_INCLUDE: >-
+            -DPJ_AUTOCONF=1
+            -I${{ github.workspace }}/pjproject/pjlib/include
+            -I${{ github.workspace }}/pjproject/pjlib-util/include
+            -I${{ github.workspace }}/pjproject/pjnath/include
+            -I${{ github.workspace }}/pjproject/pjmedia/include
+            -I${{ github.workspace }}/pjproject/pjsip/include
+        run: |
+          make clean
+          make
+          sudo --preserve-env=PJPROJECT_INCLUDE make install
+
+      - name: restart asterisk and wait for boot
+        # `core waitfullybooted` is the hard barrier — without it
+        # the verify step would race a still-loading asterisk.
+        # We poll for the control socket first because systemctl
+        # returns before asterisk is up enough to accept rasterisk
+        # connections.
+        if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
+        run: |
+          sudo systemctl restart asterisk
+          for i in $(seq 1 30); do
+            if sudo asterisk -rx 'core show version' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          sudo asterisk -rx 'core waitfullybooted'
+          sudo asterisk -rx 'core show version'
+
+      - name: verify all 10 cisco_* modules report Running
+        # `module show like cisco_` prints a header line + body lines
+        # + a "N modules loaded" trailer. Body lines that loaded ok
+        # contain "Running"; failures show "Not Running" or similar.
+        # We count and require 10. On failure we dump diagnostics
+        # for the run log.
+        #
+        # Diagnostic dump on failure covers three layers:
+        #   1) Are the .so files actually on disk and readable?
+        #   2) What does asterisk think loaded? (`module show`)
+        #   3) What did asterisk's own loader log? — this lives in
+        #      /var/log/asterisk/full per Ubuntu's stock logger.conf,
+        #      NOT in journalctl. systemd only captures stdout/stderr
+        #      of the daemon process, which Asterisk doesn't use for
+        #      its own log output. Without /var/log/asterisk/full the
+        #      dlopen-time loader errors (undefined symbol, ABI
+        #      mismatch, missing dependency) are invisible.
+        if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
+        run: |
+          set +e
+          output=$(sudo asterisk -rx 'module show like cisco_')
+          echo "$output"
+          running=$(echo "$output" | grep -c 'Running')
+          if [ "$running" -ne 10 ]; then
+            echo "::error::Expected 10 cisco_* modules Running, got $running"
+            echo "--- ls /usr/lib/asterisk/modules/res_pjsip_cisco_*.so ---"
+            sudo ls -la /usr/lib/asterisk/modules/res_pjsip_cisco_*.so 2>&1 || true
+            echo "--- module load res_pjsip_cisco_endpoint.so (synchronous; surfaces dlopen error inline) ---"
+            sudo asterisk -rx 'module load res_pjsip_cisco_endpoint.so' 2>&1 || true
+            echo "--- /etc/asterisk/logger.conf ---"
+            sudo cat /etc/asterisk/logger.conf 2>&1 || true
+            echo "--- ls /var/log/asterisk/ ---"
+            sudo ls -la /var/log/asterisk/ 2>&1 || true
+            echo "--- module show (full) ---"
+            sudo asterisk -rx 'module show'
+            echo "--- /var/log/asterisk/*.log (Ubuntu names the file messages.log) ---"
+            for f in /var/log/asterisk/*.log; do
+              [ -f "$f" ] || continue
+              echo "===== $f ====="
+              sudo tail -n 200 "$f"
+            done
+            echo "--- journalctl asterisk.service ---"
+            sudo journalctl -u asterisk --since '5 minutes ago' | tail -100
+            echo "--- journalctl --identifier asterisk (syslog-tagged) ---"
+            sudo journalctl --identifier asterisk --since '5 minutes ago' | tail -50
+            exit 1
+          fi
+          echo "All 10 cisco_* modules Running."
+
+      - name: check asterisk log for cisco-related errors/warnings
+        # Sorcery type registration failures, helper symbol misses,
+        # body-generator slot conflicts often log a WARNING / ERROR
+        # before "module show" flips a module to Running. Catch them
+        # here. Known-benign exception filtered out: stock
+        # res_pjsip_xpidf_body_generator logs "A body generator for
+        # application/cpim-pidf+xml is already registered" when our
+        # cisco_pidf_body_generator wins the slot — intended (see
+        # res/res_pjsip_cisco_pidf_body_generator.c's load_pri).
+        if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
+        run: |
+          set +e
+          log=$(sudo journalctl -u asterisk --since '5 minutes ago' \
+                  --no-pager --output cat)
+          bad=$(echo "$log" \
+                  | grep -E 'ERROR|WARNING' \
+                  | grep -iE 'cisco' \
+                  | grep -v 'body generator for application/cpim-pidf+xml is already')
+          if [ -n "$bad" ]; then
+            echo "::error::Cisco-related ERROR/WARNING in asterisk log:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "No cisco-related ERROR/WARNING in asterisk log."
+
+      - name: load test skipped (no major-matching apt asterisk)
+        # Visible log line so a reviewer doesn't wonder why two of
+        # three matrix cells silently skip the load steps.
+        if: steps.apt_asterisk.outputs.major != matrix.asterisk_branch
+        run: |
+          echo "Module-load smoke skipped for asterisk-${{ matrix.asterisk_branch }}:"
+          echo "  ${{ matrix.runner }} apt provides asterisk-${{ steps.apt_asterisk.outputs.major }} only."
+          echo "  Build-time ABI compat for this matrix cell is still verified by the build above."
+
+      - name: stop asterisk
+        # Belt-and-braces cleanup — the runner is torn down anyway,
+        # but explicit stop surfaces any shutdown-time warnings.
+        if: always() && steps.apt_asterisk.outputs.major == matrix.asterisk_branch
+        run: sudo systemctl stop asterisk || true

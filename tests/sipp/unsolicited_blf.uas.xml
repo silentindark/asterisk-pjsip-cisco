@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Unsolicited BLF NOTIFYs — UAS half.
+
+  Historical SIPp UAS sketch. run.sh now uses collect_unsolicited_blf.py
+  for this half because each unsolicited NOTIFY is an independent
+  out-of-dialog request with its own Call-ID, which SIPp 3.7 cannot
+  reliably express as one linear UAS call.
+
+  This sketch listens on the Contact URI port the paired UAC
+  registered. After 1010's REGISTER, asterisk fires THREE deferred
+  post-REGISTER tasks at this Contact:
+
+    * cisco-bulkupdate: one REFER carrying 1010's line config (every
+      type=cisco endpoint triggers it).
+    * cisco-unsolicited-blf: one Event: presence NOTIFY per entry in
+      1010's subscribe= list — 1030 and 1050, so two NOTIFYs.
+
+  Order is non-deterministic. SIPp 3.7's <recv> requires a method to
+  match anything, so we can't write "match either REFER or NOTIFY".
+  Workaround: optional REFER recv slots in every gap, immediately
+  followed by mandatory NOTIFY recvs as anchors. NO <send> after
+  the optional REFERs — SIPp 3.7 rejects "optional recv → send"
+  without a preceding mandatory anchor. We just consume the REFER
+  silently; the asterisk-side transaction times out but doesn't
+  fail this scenario. The REFER content is asserted by the
+  dedicated bulkupdate_refer scenario instead.
+-->
+<scenario name="cisco_unsolicited_blf_uas">
+
+  <!-- Slot 1: optional REFER before first NOTIFY (no ACK; consumed silently). -->
+  <recv request="REFER" optional="true" crlf="true"/>
+
+  <!-- Slot 2: first mandatory NOTIFY. -->
+  <recv request="NOTIFY" crlf="true">
+    <action>
+      <ereg regexp="Event: *presence"                   search_in="msg" check_it="true" assign_to="evt_hdr_1"/>
+      <ereg regexp="urn:cisco:params:xml:ns:pidf:rpid"   search_in="msg" check_it="true" assign_to="cisco_ns_1"/>
+      <ereg regexp="&lt;tuple id=&quot;10(30|50)&quot;"  search_in="msg" check_it="true" assign_to="target_1"/>
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      X-Test-Asserts: [$evt_hdr_1] [$cisco_ns_1] [$target_1]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Slot 4: optional REFER between NOTIFYs. -->
+  <recv request="REFER" optional="true" crlf="true"/>
+
+  <!-- Slot 5: second mandatory NOTIFY. -->
+  <recv request="NOTIFY" crlf="true">
+    <action>
+      <ereg regexp="Event: *presence"                   search_in="msg" check_it="true" assign_to="evt_hdr_2"/>
+      <ereg regexp="urn:cisco:params:xml:ns:pidf:rpid"   search_in="msg" check_it="true" assign_to="cisco_ns_2"/>
+      <ereg regexp="&lt;tuple id=&quot;10(30|50)&quot;"  search_in="msg" check_it="true" assign_to="target_2"/>
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      X-Test-Asserts: [$evt_hdr_2] [$cisco_ns_2] [$target_2]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- No trailing optional REFER slot: SIPp 3.7 won't end the call
+       until every optional recv has either matched or been ruled out
+       (which happens when a later element matches), so a trailing
+       optional ties up the scenario waiting for a message that never
+       arrives. asterisk will retransmit any unACKed late-REFER on the
+       TCP socket, but by then the scenario has ended and SIPp tears
+       the connection down. -->
+
+  <ResponseTimeRepartition value="10, 20, 30, 50, 100, 200"/>
+  <CallLengthRepartition value="10, 50, 100, 500, 1000"/>
+
+</scenario>

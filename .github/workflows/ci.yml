@@ -75,6 +75,7 @@ jobs:
             wget \
             curl \
             jq \
+            python3 \
             ca-certificates \
             libxml2-dev \
             libxml2-utils \
@@ -87,6 +88,14 @@ jobs:
 
       - name: resolve latest ${{ matrix.asterisk_branch }} tag
         id: resolve
+        env:
+          # Authenticate the api.github.com call so we use the 5000/hour
+          # token rate limit instead of the 60/hour shared-IP one. GitHub
+          # Actions runners share egress IPs across the world; the
+          # unauthenticated limit is exhausted fast enough that the call
+          # routinely 403s in busy periods (observed in two of three
+          # cells back-to-back on this branch).
+          GH_TOKEN: ${{ github.token }}
         run: |
           # The /tags?per_page=100 endpoint only returns the most
           # recently created tags (certified-* releases dominate).
@@ -97,6 +106,8 @@ jobs:
           # sort -V for the highest minor+patch.
           BRANCH='${{ matrix.asterisk_branch }}'
           TAG=$(curl -fsSL \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
                   "https://api.github.com/repos/asterisk/asterisk/git/matching-refs/tags/${BRANCH}" \
               | jq -r '.[].ref' \
               | sed 's|^refs/tags/||' \
@@ -200,7 +211,7 @@ jobs:
 
       - name: build
         env:
-          # Pjproject header set we just unpacked. PJPROJECT_DIR
+          # Pjproject header set we just unpacked. ASTERISK_SRC_DIR
           # below points the Makefile at asterisk-src/include for
           # asterisk headers (the only safe way to ensure struct
           # layouts match - asterisk-dev from apt is frequently
@@ -212,7 +223,7 @@ jobs:
             -I${{ github.workspace }}/pjproject/pjnath/include
             -I${{ github.workspace }}/pjproject/pjmedia/include
             -I${{ github.workspace }}/pjproject/pjsip/include
-        run: make PJPROJECT_DIR=${{ github.workspace }}/asterisk-src
+        run: make ASTERISK_SRC_DIR=${{ github.workspace }}/asterisk-src
 
       - name: verify .so files produced
         run: |
@@ -273,13 +284,13 @@ jobs:
             -I${{ github.workspace }}/pjproject/pjnath/include
             -I${{ github.workspace }}/pjproject/pjmedia/include
             -I${{ github.workspace }}/pjproject/pjsip/include
-          PJPROJECT_DIR: ${{ github.workspace }}/asterisk-src
+          ASTERISK_SRC_DIR: ${{ github.workspace }}/asterisk-src
         run: |
           # CI builds against a downloaded asterisk source tree, not the
           # apt asterisk-dev package, so the .deb's Build-Depends
           # (asterisk-dev) isn't installed here. -d skips the dependency
           # check; we only verify the packaging metadata is well-formed
-          # and dpkg-buildpackage produces a .deb. PJPROJECT_DIR /
+          # and dpkg-buildpackage produces a .deb. ASTERISK_SRC_DIR /
           # PJPROJECT_INCLUDE flow through the env into debian/rules ->
           # dh -> our Makefile.
           sudo apt-get install -y devscripts debhelper
@@ -321,23 +332,32 @@ jobs:
       # history for the deliberation.
       # ----------------------------------------------------------
 
-      - name: detect apt asterisk major version
+      - name: detect apt asterisk version
         id: apt_asterisk
         run: |
           # apt-cache madison emits e.g. "asterisk | 1:20.6.0~dfsg+~cs6.13.40431414-1 | ..."
           # — the third field is the Debian version; strip the epoch
-          # (everything before ':'), then take the major component.
-          APT_VER=$(apt-cache madison asterisk 2>/dev/null \
+          # (everything before ':'), then split into major + full upstream
+          # tag (e.g. "20.6.0"). The full version drives our apt-matching
+          # pjproject fetch below; CLAUDE.md's "header-mismatch trap"
+          # bites hard if we pjproject-pin against the wrong asterisk tag.
+          APT_DEB=$(apt-cache madison asterisk 2>/dev/null \
                       | head -1 \
                       | awk -F'|' '{print $2}' \
-                      | sed 's/^[[:space:]]*//;s/^[0-9]*://' \
-                      | cut -d. -f1)
-          if [ -z "$APT_VER" ]; then
-            APT_VER="(none)"
+                      | sed 's/^[[:space:]]*//;s/^[0-9]*://')
+          # "20.6.0~dfsg+~cs..." → "20.6.0"
+          APT_FULL=$(echo "$APT_DEB" | sed 's/~.*//;s/-.*//')
+          APT_MAJOR=$(echo "$APT_FULL" | cut -d. -f1)
+          if [ -z "$APT_MAJOR" ]; then
+            APT_MAJOR="(none)"
+            APT_FULL="(none)"
           fi
-          echo "apt asterisk major version: $APT_VER"
-          echo "matrix asterisk branch:     ${{ matrix.asterisk_branch }}"
-          echo "major=$APT_VER" >> "$GITHUB_OUTPUT"
+          echo "apt asterisk Debian version: $APT_DEB"
+          echo "apt asterisk upstream tag:   $APT_FULL"
+          echo "apt asterisk major version:  $APT_MAJOR"
+          echo "matrix asterisk branch:      ${{ matrix.asterisk_branch }}"
+          echo "major=$APT_MAJOR" >> "$GITHUB_OUTPUT"
+          echo "full=$APT_FULL" >> "$GITHUB_OUTPUT"
 
       - name: install asterisk runtime + headers from apt
         # asterisk + asterisk-modules: the daemon and its PJSIP
@@ -354,57 +374,139 @@ jobs:
         #
         # Note: pjproject has no -dev package on Debian/Ubuntu —
         # asterisk bundles pjproject statically into res_pjsip.so.
-        # We reuse the pjproject headers fetched earlier in the
-        # workflow; pjproject ABI is stable enough across minor
-        # versions that the latest-pin we resolved is compatible
-        # with whatever apt's asterisk was built against.
+        # We need a *separate* pjproject header set matching the
+        # exact upstream version apt's asterisk binary bundles (the
+        # "fetch pjproject matching apt asterisk" step below). The
+        # earlier latest-tag fetch is fine for the build-against-
+        # upstream check but is silently ABI-incompatible at runtime
+        # whenever the latest-tag bumped pjproject vs apt's frozen
+        # bundle (asterisk 20.6 ships pjproject 2.14 but 20.15+
+        # bumped to 2.16; struct offsets shift and rdata->msg_info.msg
+        # ends up reading the wrong field).
         if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
         run: |
           sudo apt-get install -y \
             asterisk asterisk-modules \
-            asterisk-dev
+            asterisk-dev \
+            sip-tester
+
+      - name: prepare apt asterisk source tree for ASTERISK_SRC_DIR
+        # `apt source asterisk` pulls the *exact* source tarballs
+        # Debian used to build the apt binary. Combined with
+        # ASTERISK_SRC_DIR mode + the Makefile's auto-application of
+        # asterisk's third-party/pjproject/patches/config_site.h,
+        # this gives our rebuild the same pjsip / pjmedia struct
+        # layouts the apt binary was compiled with — required by
+        # CLAUDE.md's "header-mismatch trap" rule. Without this
+        # alignment, on_rx_request hooks silently observe NULL
+        # msg pointers (every rdata->msg_info.msg read lands at
+        # the wrong offset).
+        if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
+        run: |
+          # Ubuntu noble switched /etc/apt/sources.list.d/ubuntu.sources
+          # to deb822 with `Types: deb` only — flip on deb-src so
+          # apt-get source has something to read.
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' \
+              /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update -qq
+
+          mkdir -p apt-source
+          (cd apt-source && apt-get source asterisk)
+          SRC=$(find apt-source -maxdepth 1 -type d -name 'asterisk-*' | head -1)
+          if [ -z "$SRC" ]; then
+            echo "::error::Could not find extracted asterisk source"
+            ls -la apt-source
+            exit 1
+          fi
+          echo "APT_ASTERISK_SRC=${{ github.workspace }}/$SRC" >> "$GITHUB_ENV"
+          echo "Debian asterisk source extracted to: $SRC"
+
+          # Debian splits pjproject into a separate orig-Xpjproject.tar.xz
+          # which dpkg-source extracts to $SRC/Xpjproject. Our Makefile's
+          # ASTERISK_SRC_DIR mode (and asterisk's own build) expects pjproject
+          # at $SRC/third-party/pjproject/source. Move it into place.
+          PJSRC=$(find "$SRC" -maxdepth 4 -type d -name pjlib | head -1)
+          if [ -z "$PJSRC" ]; then
+            echo "::error::No pjproject (pjlib dir) found in apt source"
+            exit 1
+          fi
+          PJROOT=$(dirname "$PJSRC")
+          if [ "$PJROOT" != "$SRC/third-party/pjproject/source" ]; then
+            mkdir -p "$SRC/third-party/pjproject/source"
+            cp -r "$PJROOT/." "$SRC/third-party/pjproject/source/"
+          fi
+          PJ_SOURCE="$SRC/third-party/pjproject/source"
+
+          # K&R prototype fix that stock pjproject 2.x carries — trips
+          # -Werror -Wstrict-prototypes under our build. See the upstream
+          # fetch step for the longer rationale.
+          sed -i 's|pj_thread_unregister()|pj_thread_unregister(void)|' \
+              "$PJ_SOURCE/pjlib/include/pj/os.h"
+
+          # Empty config_site.h so pjproject's standalone ./configure
+          # (which generates os_auto.h / m_auto.h / sock_select.h) doesn't
+          # trip on asterisk_malloc_debug.h referencing symbols the
+          # configure link-tests can't resolve. The Makefile overlays
+          # asterisk's real config_site.h on top after configure has
+          # finished.
+          : > "$PJ_SOURCE/pjlib/include/pj/config_site.h"
+          (cd "$PJ_SOURCE" && ./configure --disable-libwebrtc-aec >/dev/null)
+
+          # Diagnostic: list what's in third-party/pjproject/ so we can
+          # see whether Debian's ~dfsg repackaging stripped the patches/
+          # subdir (it shouldn't — those files are GPL-2 — but verify).
+          echo "--- $SRC/third-party/pjproject/ ---"
+          ls -la "$SRC/third-party/pjproject/" || true
+          echo "--- $SRC/third-party/pjproject/patches/ (if exists) ---"
+          ls -la "$SRC/third-party/pjproject/patches/" 2>/dev/null || \
+              echo "(patches/ subdir missing from Debian source)"
+
+          # Fallback: if Debian's source omits asterisk's pjproject
+          # patches/ overlay, seed it from the upstream-tag asterisk-src
+          # tree we downloaded earlier in the workflow. The latest 20.x
+          # tag's config_site.h has minor field drift from 20.6's
+          # (PJMEDIA_MAX_SDP_FMT bumped 64→72, PJ_MAX_SOCKOPT_PARAMS
+          # added) — but the pjsip_rx_data critical macros
+          # (PJSIP_MAX_PKT_LEN, PJSIP_MAX_MODULE) are stable across
+          # 20.x, which is what gates our on_rx_request hooks. The SDP
+          # struct drift only affects cisco_call_extras/video.c, which
+          # the SIPp scenarios don't exercise.
+          if ! ls "$SRC/third-party/pjproject/patches/"*.h >/dev/null 2>&1; then
+            echo "Seeding patches/*.h from asterisk-src (Debian source omits them)"
+            mkdir -p "$SRC/third-party/pjproject/patches"
+            cp -v asterisk-src/third-party/pjproject/patches/*.h \
+                  "$SRC/third-party/pjproject/patches/"
+          fi
 
       - name: rebuild + install modules against apt asterisk-dev
-        # The earlier `make` step compiled against the resolved
-        # upstream tag (e.g. 20.13.x). That's our compile-time-
-        # against-latest signal and stays the load-bearing check
-        # for ABI breakage in unreleased asterisk changes. But the
-        # resulting .so files reference symbols as-named in that
-        # tag, which may not match apt's older patch within the
-        # same LTS major:
+        # Re-build with ASTERISK_SRC_DIR pointing at the apt asterisk
+        # source tree. Three things flow from that:
         #
-        #   apt 20.6.0:  ast_sip_push_task         (function symbol)
-        #   upstream 20.13+: __ast_sip_push_task   (renamed; old name
-        #                                           became a macro)
+        # 1. pjsip headers come from $APT_ASTERISK_SRC/third-party/
+        #    pjproject/source, which is apt's binary's exact pjproject
+        #    (~2.13.1 for asterisk 20.6).
+        # 2. The Makefile's auto-patch rule overlays
+        #    $APT_ASTERISK_SRC/third-party/pjproject/patches/
+        #    config_site.h + asterisk_malloc_debug.h, which is what
+        #    Debian's asterisk build did. Struct layouts now match.
+        # 3. asterisk headers come from $APT_ASTERISK_SRC/include,
+        #    which is what apt asterisk-dev ships (Debian binds them).
+        #    No symbol-rename surprises like
+        #    ast_sip_push_task → __ast_sip_push_task.
         #
-        # Rebuild without PJPROJECT_DIR so the Makefile picks up
-        # /usr/include/asterisk from asterisk-dev (matching the
-        # apt binary). PJPROJECT_INCLUDE still points at the
-        # fetched pjproject headers (asterisk-dev does NOT ship
-        # pjproject headers — see `install asterisk runtime`).
-        #
-        # `make clean && make && sudo make install` runs in one
-        # step so PJPROJECT_INCLUDE stays in scope for all three
-        # (sudo --preserve-env carries it through `sudo make
-        # install`; the Makefile's check-headers prereq otherwise
-        # re-runs and fails when it can't find pjproject).
-        # ASTERISK_MODULES_DIR / ASTERISK_DOC_DIR auto-resolve
-        # from /etc/asterisk/asterisk.conf via the Makefile.
+        # `make clean && make && sudo make install` runs together so
+        # ASTERISK_SRC_DIR stays in scope through all three (sudo
+        # --preserve-env carries it through `sudo make install`).
+        # ASTERISK_MODULES_DIR / ASTERISK_DOC_DIR auto-resolve from
+        # /etc/asterisk/asterisk.conf via the Makefile.
         if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
-        env:
-          PJPROJECT_INCLUDE: >-
-            -DPJ_AUTOCONF=1
-            -I${{ github.workspace }}/pjproject/pjlib/include
-            -I${{ github.workspace }}/pjproject/pjlib-util/include
-            -I${{ github.workspace }}/pjproject/pjnath/include
-            -I${{ github.workspace }}/pjproject/pjmedia/include
-            -I${{ github.workspace }}/pjproject/pjsip/include
         run: |
           make clean
-          make
-          sudo --preserve-env=PJPROJECT_INCLUDE make install
+          make ASTERISK_SRC_DIR="$APT_ASTERISK_SRC"
+          sudo --preserve-env=APT_ASTERISK_SRC \
+              make install ASTERISK_SRC_DIR="$APT_ASTERISK_SRC"
 
-      - name: install test pjsip.conf
+      - name: install test pjsip.conf + extensions.conf
         # Drop in a known-good pjsip.conf with a spread of [type=cisco]
         # sections so sorcery type registration + field validation runs
         # against real config. Apt's asterisk-config ships a default
@@ -412,8 +514,16 @@ jobs:
         # is safe in the throwaway runner. Five endpoints (1010 / 1030 /
         # 1031 / 1032 / 1050) exercise every documented type=cisco field
         # at least once with a non-default value.
+        #
+        # extensions.conf provides hints for the five endpoints in the
+        # ci-test context that pjsip.conf routes them through. Needed by
+        # the SIPp SUBSCRIBE presence scenario — asterisk can't push a
+        # NOTIFY for an extension without a hint defined.
         if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
-        run: sudo cp tests/ci/pjsip.conf /etc/asterisk/pjsip.conf
+        run: |
+          sudo cp tests/ci/pjsip.conf      /etc/asterisk/pjsip.conf
+          sudo cp tests/ci/extensions.conf /etc/asterisk/extensions.conf
+          sudo cp tests/ci/logger.conf     /etc/asterisk/logger.conf
 
       - name: restart asterisk and wait for boot
         # `core waitfullybooted` is the hard barrier — without it
@@ -524,6 +634,29 @@ jobs:
             fi
           done
           echo "All 5 type=cisco sections loaded; no sorcery errors logged."
+
+      - name: run SIPp Cisco wire-format scenarios
+        # Drives a SIPp-simulated Cisco phone through full REGISTER /
+        # auth / 200-OK / de-register flow against the running
+        # asterisk. Asserts the 200 OK response carries the
+        # optionsind multipart body, and that the PATH C MAC harvest
+        # + Reason-header parsing populated the cisco_mac map.
+        # See tests/sipp/README.md.
+        if: steps.apt_asterisk.outputs.major == matrix.asterisk_branch
+        run: bash tests/sipp/run.sh
+
+      - name: upload SIPp traces on failure
+        # Capture SIPp's per-call summary + error log when the
+        # scenario step fails. Without these, debugging a wire-
+        # format regression means re-running CI with manual print
+        # statements — slow and noisy.
+        if: failure() && steps.apt_asterisk.outputs.major == matrix.asterisk_branch
+        uses: actions/upload-artifact@v4
+        with:
+          name: sipp-traces-asterisk${{ matrix.asterisk_branch }}
+          path: /tmp/sipp-traces/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: check asterisk log for cisco-related errors/warnings
         # Sorcery type registration failures, helper symbol misses,
